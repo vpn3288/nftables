@@ -802,14 +802,8 @@ filter_and_confirm_ports() {
         echo -e "\n${YELLOW}这些端口可能不是必要的代理端口${RESET}"
         
         if [ "$DRY_RUN" = false ]; then
-            echo -e "${YELLOW}也要开放这些可疑端口吗？[y/N]${RESET}"
-            read -r response
-            if [[ "$response" =~ ^[Yy]([eE][sS])?$ ]]; then
-                safe_ports+=("${suspicious_ports[@]}")
-                info "用户确认开放可疑端口"
-            else
-                info "跳过可疑端口"
-            fi
+            # 自动跳过可疑端口，不提示用户
+            info "自动跳过非标准端口，保持系统安全"
         fi
     fi
     
@@ -821,12 +815,8 @@ filter_and_confirm_ports() {
     fi
     
     if [ "$DRY_RUN" = false ] && [ ${#NAT_RULES[@]} -eq 0 ]; then
-        echo -e "\n${CYAN}🔄 配置端口转发功能吗？[y/N]${RESET}"
-        echo -e "${YELLOW}端口转发可以将端口范围重定向到单个目标端口${RESET}"
-        read -r response
-        if [[ "$response" =~ ^[Yy]([eE][sS])?$ ]]; then
-            add_port_range_interactive
-        fi
+        # 不提示用户，跳过端口转发配置
+        info "未检测到现有端口转发规则，跳过手动配置"
     fi
     
     if [ ${#safe_ports[@]} -eq 0 ]; then
