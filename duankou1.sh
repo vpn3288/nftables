@@ -59,26 +59,29 @@ WEB_PANEL_PROCESSES=(
     "nginx" "caddy" "apache2" "httpd" "haproxy" "envoy"
 )
 
-# 代理配置文件
-PROXY_CONFIG_FILES=(
-    "/opt/hiddify-manager/hiddify-panel/hiddify_panel/panel/commercial/restapi/v2/admin/admin.py"
-    "/opt/hiddify-manager/log/system/hiddify-panel.log"
-    "/opt/hiddify-manager/hiddify-panel/config.py"
-    "/opt/hiddify-manager/.env"
-    "/etc/x-ui/config.json"
-    "/opt/3x-ui/bin/config.json"
-    "/usr/local/x-ui/bin/config.json"
-    "/usr/local/etc/xray/config.json"
-    "/etc/xray/config.json"
-    "/usr/local/etc/v2ray/config.json"
-    "/etc/v2ray/config.json"
-    "/etc/sing-box/config.json"
-    "/opt/sing-box/config.json"
-    "/usr/local/etc/sing-box/config.json"
-    "/etc/hysteria/config.json"
-    "/etc/tuic/config.json"
-    "/etc/trojan/config.json"
-)
+    # 检测代理软件特有配置文件
+    PROXY_CONFIG_FILES=(
+        "/etc/s-box/sb.json"
+        "/etc/s-box/sb10.json" 
+        "/etc/s-box/sb11.json"
+        "/opt/hiddify-manager/hiddify-panel/hiddify_panel/panel/commercial/restapi/v2/admin/admin.py"
+        "/opt/hiddify-manager/log/system/hiddify-panel.log"
+        "/opt/hiddify-manager/hiddify-panel/config.py"
+        "/opt/hiddify-manager/.env"
+        "/etc/x-ui/config.json"
+        "/opt/3x-ui/bin/config.json"
+        "/usr/local/x-ui/bin/config.json"
+        "/usr/local/etc/xray/config.json"
+        "/etc/xray/config.json"
+        "/usr/local/etc/v2ray/config.json"
+        "/etc/v2ray/config.json"
+        "/etc/sing-box/config.json"
+        "/opt/sing-box/config.json"
+        "/usr/local/etc/sing-box/config.json"
+        "/etc/hysteria/config.json"
+        "/etc/tuic/config.json"
+        "/etc/trojan/config.json"
+    )
 
 # Hiddify 常用端口
 HIDDIFY_COMMON_PORTS=(
@@ -333,7 +336,7 @@ detect_ssh_port() {
     info "检测到 SSH 端口: $SSH_PORT"
 }
 
-# 检测现有的 NAT 规则
+# 检测现有的 NAT 规则 
 detect_existing_nat_rules() {
     info "检测现有端口转发规则..."
     
@@ -434,6 +437,44 @@ detect_existing_nat_rules() {
         for rule in "${NAT_RULES[@]}"; do
             echo -e "  ${GREEN}• $rule${RESET}"
         done
+        
+        echo -e "\n${YELLOW}⚠️  检测到现有的端口转发配置！${RESET}"
+        echo -e "${YELLOW}这些规则可能是由 Sing-box、Hiddify 或其他代理软件创建的${RESET}"
+        
+        if [ "$DRY_RUN" = false ]; then
+            echo -e "\n${CYAN}如何处理现有的端口转发规则？${RESET}"
+            echo -e "${GREEN}1. 保留现有规则，仅添加新的防火墙保护 (推荐)${RESET}"
+            echo -e "${YELLOW}2. 清理现有规则，重新配置${RESET}"
+            echo -e "${RED}3. 跳过端口转发配置${RESET}"
+            readp "请选择 [1-3] (默认: 1): " nat_action
+            
+            case "${nat_action:-1}" in
+                1)
+                    info "将保留现有端口转发规则，仅添加防火墙保护"
+                    # 保持现有的NAT_RULES数组
+                    ;;
+                2)
+                    warning "将清理现有端口转发规则，请确保这不会影响正在运行的代理服务"
+                    echo -e "${RED}确认清理现有端口转发规则？[y/N]${RESET}"
+                    read -r confirm
+                    if [[ "$confirm" =~ ^[Yy]([eE][sS])?$ ]]; then
+                        NAT_RULES=()
+                        DETECTED_PORTS=($(printf '%s\n' "${DETECTED_PORTS[@]}" | grep -v "$(for rule in "${NAT_RULES[@]}"; do split_nat_rule "$rule" "->" "2"; done)" | sort -nu))
+                        info "已清理现有端口转发规则配置"
+                    else
+                        info "取消清理，将保留现有规则"
+                    fi
+                    ;;
+                3)
+                    NAT_RULES=()
+                    info "跳过端口转发配置"
+                    ;;
+                *)
+                    info "无效选择，将保留现有规则"
+                    ;;
+            esac
+        fi
+        
         success "检测到 ${#NAT_RULES[@]} 条端口转发规则"
     else
         info "未检测到现有端口转发规则"
