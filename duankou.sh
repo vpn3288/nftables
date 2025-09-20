@@ -77,7 +77,7 @@ show_rules_preview() {
         done
     fi
     
-    echo "        limit rate 3/minute log prefix \"nftables-drop: \" level info"
+    echo "        limit rate 3/minute log prefix \"proxy-firewall-drop: \" level info"
     echo "    }"
     echo
     echo "    chain forward {"
@@ -1558,7 +1558,7 @@ apply_firewall_rules() {
     fi
     
     # 记录并丢弃其他连接（限制日志频率）
-    nft add rule inet "$NFTABLES_TABLE" input limit rate 3/minute log prefix "nftables-drop: " level info
+    nft add rule inet "$NFTABLES_TABLE" input limit rate 3/minute log prefix "proxy-firewall-drop: " level info
     
     OPENED_PORTS=${#DETECTED_PORTS[@]}
     success "nftables 规则应用成功"
