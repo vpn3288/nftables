@@ -1,5 +1,5 @@
 # nftables
-基本使用
+# 基本使用
 
 bash <(curl -sSL https://raw.githubusercontent.com/vpn3288/nftables/refs/heads/main/duankou.sh)
 
