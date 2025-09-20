@@ -1371,7 +1371,11 @@ apply_firewall_rules() {
     
     # ICMP 支持（网络诊断）
     nft add rule inet "$NFTABLES_TABLE" input icmp type echo-request limit rate 10/second accept
-    nft add rule inet "$NFTABLES_TABLE" input icmpv6 type '{ echo-request, nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert }' accept
+    nft add rule inet "$NFTABLES_TABLE" input icmpv6 type echo-request accept
+    nft add rule inet "$NFTABLES_TABLE" input icmpv6 type nd-neighbor-solicit accept
+    nft add rule inet "$NFTABLES_TABLE" input icmpv6 type nd-neighbor-advert accept
+    nft add rule inet "$NFTABLES_TABLE" input icmpv6 type nd-router-solicit accept
+    nft add rule inet "$NFTABLES_TABLE" input icmpv6 type nd-router-advert accept
     
     # SSH 保护
     setup_ssh_protection
