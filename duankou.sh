@@ -1128,7 +1128,7 @@ save_nftables_rules() {
     
     # 创建服务文件以确保规则持久化
     if command -v systemctl >/dev/null 2>&1; then
-        cat > /etc/systemd/system/nftables-proxy.service << EOF
+        cat > /etc/systemd/system/nftables-proxy.service << 'EOF'
 [Unit]
 Description=恢复代理防火墙 nftables 规则
 After=network-pre.target
@@ -1137,12 +1137,14 @@ Wants=network-pre.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/nft -f $config_file
+ExecStart=/usr/sbin/nft -f CONFIG_FILE_PLACEHOLDER
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
+        # 替换配置文件路径
+        sed -i "s|CONFIG_FILE_PLACEHOLDER|$config_file|g" /etc/systemd/system/nftables-proxy.service
         systemctl enable nftables-proxy.service >/dev/null 2>&1 || true
         systemctl enable nftables.service >/dev/null 2>&1 || true
     fi
@@ -1180,7 +1182,7 @@ show_rules_preview() {
         done
     fi
     
-            echo "        limit rate 3/minute log prefix \"nftables-drop: \" level info"
+            echo "        limit rate 3/minute log prefix \\\"nftables-drop: \\\" level info"
     echo "    }"
     echo
     echo "    chain forward {"
