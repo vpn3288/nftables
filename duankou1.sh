@@ -1443,9 +1443,8 @@ main() {
     
     check_system
     detect_ssh_port
-    
-    # 在清理防火墙之前检测现有的NAT规则
     detect_existing_nat_rules
+    cleanup_firewalls
     
     if ! detect_proxy_processes; then
         warning "建议在运行此脚本之前启动代理服务以获得最佳效果"
@@ -1461,9 +1460,6 @@ main() {
             error_exit "无法确定要开放的端口"
         fi
     fi
-    
-    # 在检测完所有端口和NAT规则后再清理防火墙
-    cleanup_firewalls
     
     apply_firewall_rules
     verify_port_hopping
