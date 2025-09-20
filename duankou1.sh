@@ -141,6 +141,11 @@ info() {
     echo -e "${CYAN}ℹ️  $1${RESET}"
 }
 
+# 读取用户输入函数（兼容原sing-box脚本）
+readp() { 
+    read -p "$(echo -e "${YELLOW}$1${RESET}")" $2
+}
+
 # 字符串分割函数
 split_nat_rule() {
     local rule="$1"
