@@ -1,4 +1,387 @@
-#!/bin/bash
+# 显示规则预览
+show_rules_preview() {
+    echo -e "${CYAN}📋 即将应用的 nftables 规则预览:${RESET}"
+    echo
+    echo "table inet $NFTABLES_TABLE {"
+    echo "    chain input {"
+    echo "        type filter hook input priority 0; policy drop;"
+    echo "        iif lo accept"
+    echo "        ct state established,related accept"
+    echo "        icmp type echo-request limit rate 10/second accept"
+    echo "        tcp dport $SSH_PORT ct state new limit rate 4/minute accept"
+    echo
+    echo "        # 代理端口"
+    for port in "${DETECTED_PORTS[@]}"; do
+        echo "        tcp dport $port accept"
+        echo "        udp dport $port accept"
+    done
+    
+    if [ ${#NAT_RULES[@]} -gt 0 ]; then
+        echo
+        echo "        # 端口转发范围"
+        for rule in "${NAT_RULES[@]}"; do
+            local port_range=$(split_nat_rule "$rule" "->" "1")
+            local start_port=$(echo "$port_range" | cut -d'-' -f1)
+            local end_port=$(echo "$port_range" | cut -d'-' -f2)
+            echo "        tcp dport $start_port-$end_port accept"
+            echo "        udp dport $start_port-$end_port accept"
+        done
+    fi
+    
+    echo "        limit rate 3/minute log prefix \"nftables-drop: \" level info"
+    echo "    }"
+    echo
+    echo "    chain forward {"
+    echo "        type filter hook forward priority 0; policy drop;"
+    echo "    }"
+    echo
+    echo "    chain output {"
+    echo "        type filter hook output priority 0; policy accept;"
+    echo "    }"
+    
+    if [ ${#NAT_RULES[@]} -gt 0 ]; then
+        echo
+        echo "    chain prerouting {"
+        echo "        type nat hook prerouting priority -100;"
+        for rule in "${NAT_RULES[@]}"; do
+            local port_range=$(split_nat_rule "$rule" "->" "1")
+            local target_port=$(split_nat_rule "$rule" "->" "2")
+            local start_port=$(echo "$port_range" | cut -d'-' -f1)
+            local end_port=$(echo "$port_range" | cut -d'-' -f2)
+            echo "        tcp dport $start_port-$end_port dnat to :$target_port"
+            echo "        udp dport $start_port-$end_port dnat to :$target_port"
+        done
+        echo "    }"
+    fi
+    
+    echo "}"
+}
+
+# 验证端口转发功能
+verify_port_hopping() {
+    if [ ${#NAT_RULES[@]} -gt 0 ]; then
+        info "验证端口转发配置..."
+        
+        echo -e "\n${CYAN}🔍 当前 NAT 规则状态:${RESET}"
+        if command -v nft >/dev/null 2>&1 && nft list table inet "$NFTABLES_TABLE" >/dev/null 2>&1; then
+            nft list chain inet "$NFTABLES_TABLE" prerouting 2>/dev/null | grep dnat || echo "无 NAT 规则"
+        fi
+        
+        echo -e "\n${YELLOW}💡 端口转发使用说明:${RESET}"
+        echo -e "  - 客户端可以连接到范围内的任意端口"
+        echo -e "  - 所有连接都会转发到目标端口"
+        echo -e "  - 示例：范围内端口的连接转发到目标端口"
+        
+        local checked_ports=()
+        for rule in "${NAT_RULES[@]}"; do
+            local port_range=$(split_nat_rule "$rule" "->" "1")
+            local target_port=$(split_nat_rule "$rule" "->" "2")
+            
+            debug_log "验证规则: $port_range -> $target_port"
+            
+            if [ -n "$target_port" ]; then
+                if [[ ! " ${checked_ports[*]} " =~ " $target_port " ]]; then
+                    checked_ports+=("$target_port")
+                    
+                    if ss -tlnp 2>/dev/null | grep -q ":$target_port "; then
+                        echo -e "  ${GREEN}✓ 目标端口 $target_port 正在监听${RESET}"
+                    else
+                        echo -e "  ${YELLOW}⚠️  目标端口 $target_port 未在监听${RESET}"
+                        echo -e "    ${YELLOW}提示: 请确保代理服务在端口 $target_port 上运行${RESET}"
+                    fi
+                fi
+            else
+                echo -e "  ${RED}❌ 无法解析规则: $rule${RESET}"
+            fi
+        done
+        
+        echo -e "\n${CYAN}📝 端口转发规则摘要:${RESET}"
+        local unique_rules=($(printf '%s\n' "${NAT_RULES[@]}" | sort -u))
+        for rule in "${unique_rules[@]}"; do
+            local port_range=$(split_nat_rule "$rule" "->" "1")
+            local target_port=$(split_nat_rule "$rule" "->" "2")
+            echo -e "  ${CYAN}• 端口范围 $port_range → 目标端口 $target_port${RESET}"
+        done
+    fi
+}
+
+# 重置防火墙
+reset_firewall() {
+    echo -e "${YELLOW}🔄 重置防火墙到默认状态${RESET}"
+    
+    if [ "$DRY_RUN" = false ]; then
+        echo -e "${RED}警告: 这将清除所有 nftables 规则！${RESET}"
+        echo -e "${YELLOW}确认重置防火墙吗？[y/N]${RESET}"
+        read -r response
+        if [[ ! "$response" =~ ^[Yy]([eE][sS])?$ ]]; then
+            info "重置操作已取消"
+            return 0
+        fi
+    fi
+    
+    info "重置 nftables 规则..."
+    
+    if [ "$DRY_RUN" = false ]; then
+        # 删除代理防火墙表
+        if nft list table inet "$NFTABLES_TABLE" >/dev/null 2>&1; then
+            nft delete table inet "$NFTABLES_TABLE" 2>/dev/null || true
+        fi
+        
+        # 清除所有规则集（谨慎操作）
+        echo -e "${YELLOW}是否要清除所有 nftables 规则？这可能影响其他服务 [y/N]${RESET}"
+        read -r response
+        if [[ "$response" =~ ^[Yy]([eE][sS])?$ ]]; then
+            nft flush ruleset
+        fi
+        
+        # 清理服务文件
+        if [ -f "/etc/systemd/system/nftables-proxy.service" ]; then
+            systemctl disable nftables-proxy.service >/dev/null 2>&1 || true
+            rm -f /etc/systemd/system/nftables-proxy.service
+        fi
+        
+        success "防火墙已重置到默认状态"
+    else
+        info "[预览模式] 将重置所有 nftables 规则"
+    fi
+}
+
+# 显示防火墙状态
+show_firewall_status() {
+    echo -e "${CYAN}🔍 当前防火墙状态${RESET}"
+    echo
+    
+    if ! nft list table inet "$NFTABLES_TABLE" >/dev/null 2>&1; then
+        echo -e "${YELLOW}⚠️  代理防火墙表不存在${RESET}"
+        echo -e "${CYAN}当前所有 nftables 表:${RESET}"
+        nft list tables 2>/dev/null || echo "无表"
+        return 0
+    fi
+    
+    echo -e "${GREEN}📊 nftables 规则统计:${RESET}"
+    local input_rules=$(nft list chain inet "$NFTABLES_TABLE" input 2>/dev/null | grep -c "accept\|drop\|log" || echo "0")
+    local nat_rules=$(nft list chain inet "$NFTABLES_TABLE" prerouting 2>/dev/null | grep -c "dnat" || echo "0")
+    echo -e "  INPUT 规则数: $input_rules"
+    echo -e "  NAT 规则数: $nat_rules"
+    echo
+    
+    echo -e "${GREEN}🔓 开放的端口:${RESET}"
+    nft list chain inet "$NFTABLES_TABLE" input 2>/dev/null | grep "dport.*accept" | while read -r line; do
+        if echo "$line" | grep -qE "tcp dport [0-9]+"; then
+            local port=$(echo "$line" | grep -oE "dport [0-9]+" | awk '{print $2}')
+            echo -e "  • $port (tcp)"
+        elif echo "$line" | grep -qE "udp dport [0-9]+"; then
+            local port=$(echo "$line" | grep -oE "dport [0-9]+" | awk '{print $2}')
+            echo -e "  • $port (udp)"
+        elif echo "$line" | grep -qE "dport [0-9]+-[0-9]+"; then
+            local port_range=$(echo "$line" | grep -oE "dport [0-9]+-[0-9]+" | awk '{print $2}')
+            local protocol="tcp/udp"
+            if echo "$line" | grep -q "tcp"; then
+                protocol="tcp"
+            elif echo "$line" | grep -q "udp"; then
+                protocol="udp"
+            fi
+            echo -e "  • $port_range ($protocol) - 端口范围"
+        fi
+    done
+    echo
+    
+    echo -e "${GREEN}🔄 端口转发规则:${RESET}"
+    local nat_count=0
+    if nft list chain inet "$NFTABLES_TABLE" prerouting >/dev/null 2>&1; then
+        while read -r line; do
+            if echo "$line" | grep -q "dnat"; then
+                nat_count=$((nat_count + 1))
+                local port_range=""
+                local target=""
+                
+                if echo "$line" | grep -qE "dport [0-9]+-[0-9]+"; then
+                    port_range=$(echo "$line" | grep -oE "dport [0-9]+-[0-9]+" | awk '{print $2}')
+                fi
+                
+                if echo "$line" | grep -qE ":[0-9]+"; then
+                    target=$(echo "$line" | grep -oE ":[0-9]+" | sed 's/://')
+                fi
+                
+                if [ -n "$port_range" ] && [ -n "$target" ]; then
+                    local protocol="tcp/udp"
+                    if echo "$line" | grep -q "tcp"; then
+                        protocol="tcp"
+                    elif echo "$line" | grep -q "udp"; then
+                        protocol="udp"
+                    fi
+                    echo -e "  • $port_range → $target ($protocol)"
+                fi
+            fi
+        done <<< "$(nft list chain inet "$NFTABLES_TABLE" prerouting 2>/dev/null)"
+    fi
+    
+    if [ "$nat_count" -eq 0 ]; then
+        echo -e "  ${YELLOW}无端口转发规则${RESET}"
+    fi
+    echo
+    
+    echo -e "${GREEN}🛡️  SSH 保护状态:${RESET}"
+    if nft list chain inet "$NFTABLES_TABLE" input 2>/dev/null | grep -q "limit"; then
+        echo -e "  ${GREEN}✓ SSH 暴力破解防护已启用${RESET}"
+    else
+        echo -e "  ${YELLOW}⚠️  SSH 暴力破解防护未启用${RESET}"
+    fi
+    echo
+    
+    echo -e "${GREEN}🔧 WARP 检测状态:${RESET}"
+    local warp_detected=false
+    for warp_port in "${WARP_COMMON_PORTS[@]}"; do
+        if nft list chain inet "$NFTABLES_TABLE" input 2>/dev/null | grep -q "dport $warp_port"; then
+            echo -e "  ${GREEN}✓ WARP 端口 $warp_port 已开放${RESET}"
+            warp_detected=true
+        fi
+    done
+    if [ "$warp_detected" = false ]; then
+        echo -e "  ${YELLOW}⚠️  未检测到 WARP 端口${RESET}"
+    fi
+    echo
+    
+    echo -e "${CYAN}🔧 管理命令:${RESET}"
+    echo -e "  ${YELLOW}查看所有规则:${RESET} nft list ruleset"
+    echo -e "  ${YELLOW}查看代理表:${RESET} nft list table inet $NFTABLES_TABLE"
+    echo -e "  ${YELLOW}查看 NAT 规则:${RESET} nft list chain inet $NFTABLES_TABLE prerouting"
+    echo -e "  ${YELLOW}查看监听端口:${RESET} ss -tlnp"
+    echo -e "  ${YELLOW}重新配置:${RESET} bash $0"
+    echo -e "  ${YELLOW}添加端口转发:${RESET} bash $0 --add-range"
+    echo -e "  ${YELLOW}手动添加端口:${RESET} bash $0 --add-port"
+    echo -e "  ${YELLOW}重置防火墙:${RESET} bash $0 --reset"
+}
+
+# 显示最终状态
+show_final_status() {
+    echo -e "\n${GREEN}=================================="
+    echo -e "🎉 nftables 防火墙配置完成！"
+    echo -e "==================================${RESET}"
+    
+    echo -e "\n${CYAN}📊 配置摘要:${RESET}"
+    echo -e "  ${GREEN}✓ 开放端口数: $OPENED_PORTS${RESET}"
+    echo -e "  ${GREEN}✓ SSH 端口: $SSH_PORT (已保护)${RESET}"
+    echo -e "  ${GREEN}✓ 防火墙引擎: nftables${RESET}"
+    echo -e "  ${GREEN}✓ 防火墙表: $NFTABLES_TABLE${RESET}"
+    echo -e "  ${GREEN}✓ 内部服务保护: 已启用${RESET}"
+    echo -e "  ${GREEN}✓ 默认端口: 80, 443 (永久开放)${RESET}"
+    echo -e "  ${GREEN}✓ WARP 支持: 已启用${RESET}"
+    if [ ${#NAT_RULES[@]} -gt 0 ]; then
+        local unique_nat_rules=($(printf '%s\n' "${NAT_RULES[@]}" | sort -u))
+        echo -e "  ${GREEN}✓ 端口转发规则: ${#unique_nat_rules[@]} 条${RESET}"
+    fi
+    
+    if [ ${#DETECTED_PORTS[@]} -gt 0 ]; then
+        echo -e "\n${GREEN}🔓 已开放端口:${RESET}"
+        for port in "${DETECTED_PORTS[@]}"; do
+            if [[ " ${DEFAULT_OPEN_PORTS[*]} " =~ " $port " ]]; then
+                echo -e "  ${GREEN}• $port (TCP/UDP) - 默认开放${RESET}"
+            elif [[ " ${WARP_COMMON_PORTS[*]} " =~ " $port " ]]; then
+                echo -e "  ${GREEN}• $port (TCP/UDP) - WARP 端口${RESET}"
+            else
+                echo -e "  ${GREEN}• $port (TCP/UDP)${RESET}"
+            fi
+        done
+    fi
+    
+    if [ ${#NAT_RULES[@]} -gt 0 ]; then
+        echo -e "\n${CYAN}🔄 端口转发规则:${RESET}"
+        local unique_rules=($(printf '%s\n' "${NAT_RULES[@]}" | sort -u))
+        for rule in "${unique_rules[@]}"; do
+            local port_range=$(split_nat_rule "$rule" "->" "1")
+            local target_port=$(split_nat_rule "$rule" "->" "2")
+            echo -e "  ${CYAN}• $port_range → $target_port${RESET}"
+        done
+    fi
+    
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "\n${CYAN}🔍 这是预览模式，防火墙实际未被修改${RESET}"
+        return 0
+    fi
+    
+    echo -e "\n${CYAN}🔧 管理命令:${RESET}"
+    echo -e "  ${YELLOW}查看所有规则:${RESET} nft list ruleset"
+    echo -e "  ${YELLOW}查看代理表:${RESET} nft list table inet $NFTABLES_TABLE"
+    echo -e "  ${YELLOW}查看监听端口:${RESET} ss -tlnp"
+    echo -e "  ${YELLOW}查看 NAT 规则:${RESET} nft list chain inet $NFTABLES_TABLE prerouting"
+    echo -e "  ${YELLOW}查看状态:${RESET} bash $0 --status"
+    echo -e "  ${YELLOW}添加端口转发:${RESET} bash $0 --add-range"
+    echo -e "  ${YELLOW}手动添加端口:${RESET} bash $0 --add-port"
+    echo -e "  ${YELLOW}重置防火墙:${RESET} bash $0 --reset"
+    
+    echo -e "\n${GREEN}✅ 代理端口精确开放，端口转发已配置，WARP 支持已启用，内部服务受保护，服务器安全已启用！${RESET}"
+    
+    if [ ${#NAT_RULES[@]} -gt 0 ]; then
+        local has_unlistened=false
+        local checked_ports=()
+        
+        for rule in "${NAT_RULES[@]}"; do
+            local target_port=$(split_nat_rule "$rule" "->" "2")
+            if [ -n "$target_port" ] && [[ ! " ${checked_ports[*]} " =~ " $target_port " ]]; then
+                checked_ports+=("$target_port")
+                if ! ss -tlnp 2>/dev/null | grep -q ":$target_port "; then
+                    has_unlistened=true
+                    break
+                fi
+            fi
+        done
+        
+        if [ "$has_unlistened" = true ]; then
+            echo -e "\n${YELLOW}⚠️  提醒: 某些端口转发目标端口未在监听${RESET}"
+            echo -e "${YELLOW}   请确保相关代理服务正在运行，否则端口转发可能无法工作${RESET}"
+        fi
+    fi
+    
+    # 显示 nftables 服务状态
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-enabled nftables >/dev/null 2>&1; then
+            echo -e "\n${GREEN}✅ nftables 服务已启用，规则将在重启后自动恢复${RESET}"
+        else
+            echo -e "\n${YELLOW}⚠️  建议启用 nftables 服务以确保规则持久化:${RESET}"
+            echo -e "${YELLOW}   systemctl enable nftables${RESET}"
+        fi
+    fi
+}
+
+# 主函数
+main() {
+    trap 'echo -e "\n${RED}操作被中断${RESET}"; exit 130' INT TERM
+    
+    parse_arguments "$@"
+    
+    echo -e "\n${CYAN}🚀 开始智能代理端口检测和配置...${RESET}"
+    
+    check_system
+    detect_ssh_port
+    detect_existing_nat_rules
+    cleanup_firewalls
+    
+    # 检测 WARP 服务
+    detect_warp_service
+    
+    if ! detect_proxy_processes; then
+        warning "建议在运行此脚本之前启动代理服务以获得最佳效果"
+    fi
+    
+    parse_config_ports
+    detect_listening_ports
+    
+    if ! filter_and_confirm_ports; then
+        info "添加 Hiddify 常用端口作为备用..."
+        DETECTED_PORTS=("${HIDDIFY_COMMON_PORTS[@]}")
+        if ! filter_and_confirm_ports; then
+            error_exit "无法确定要开放的端口"
+        fi
+    fi
+    
+    apply_firewall_rules
+    verify_port_hopping
+    show_final_status
+}
+
+# 脚本入口点
+main "$@"#!/bin/bash
 set -e
 
 # 颜色定义
@@ -158,8 +541,9 @@ split_nat_rule() {
     fi
 }
 
+# 显示帮助信息
 show_help() {
-    cat << 'HELPEOF'
+    cat << 'HELP_END'
 精确代理端口防火墙管理脚本 v2.1.1（nftables 版本）
 
 为现代代理面板设计的智能端口管理工具
@@ -194,7 +578,7 @@ show_help() {
     ✓ 现代化 nftables 防火墙
     ✓ WARP 端口自动检测
 
-HELPEOF
+HELP_END
 }
 
 # 解析参数
@@ -1040,7 +1424,7 @@ apply_firewall_rules() {
     
     # ICMP 支持（网络诊断）
     nft add rule inet "$NFTABLES_TABLE" input icmp type echo-request limit rate 10/second accept
-    nft add rule inet "$NFTABLES_TABLE" input icmpv6 type { echo-request, nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } accept
+    nft add rule inet "$NFTABLES_TABLE" input icmpv6 type '{ echo-request, nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert }' accept
     
     # SSH 保护
     setup_ssh_protection
@@ -1127,7 +1511,7 @@ save_nftables_rules() {
     
     # 创建服务文件以确保规则持久化
     if command -v systemctl >/dev/null 2>&1; then
-        cat > /etc/systemd/system/nftables-proxy.service << 'SERVICEEOF'
+        cat > /etc/systemd/system/nftables-proxy.service << 'SERVICE_END'
 [Unit]
 Description=恢复代理防火墙 nftables 规则
 After=network-pre.target
@@ -1141,7 +1525,7 @@ RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
-SERVICEEOF
+SERVICE_END
         
         # 替换配置文件路径
         sed -i "s|CONFIGFILE|${config_file}|g" /etc/systemd/system/nftables-proxy.service
@@ -1151,388 +1535,3 @@ SERVICEEOF
     
     success "nftables 规则已保存到: $config_file"
 }
-
-# 显示规则预览
-show_rules_preview() {
-    echo -e "${CYAN}📋 即将应用的 nftables 规则预览:${RESET}"
-    echo
-    echo "table inet $NFTABLES_TABLE {"
-    echo "    chain input {"
-    echo "        type filter hook input priority 0; policy drop;"
-    echo "        iif lo accept"
-    echo "        ct state established,related accept"
-    echo "        icmp type echo-request limit rate 10/second accept"
-    echo "        tcp dport $SSH_PORT ct state new limit rate 4/minute accept"
-    echo
-    echo "        # 代理端口"
-    for port in "${DETECTED_PORTS[@]}"; do
-        echo "        tcp dport $port accept"
-        echo "        udp dport $port accept"
-    done
-    
-    if [ ${#NAT_RULES[@]} -gt 0 ]; then
-        echo
-        echo "        # 端口转发范围"
-        for rule in "${NAT_RULES[@]}"; do
-            local port_range=$(split_nat_rule "$rule" "->" "1")
-            local start_port=$(echo "$port_range" | cut -d'-' -f1)
-            local end_port=$(echo "$port_range" | cut -d'-' -f2)
-            echo "        tcp dport $start_port-$end_port accept"
-            echo "        udp dport $start_port-$end_port accept"
-        done
-    fi
-    
-            echo "        limit rate 3/minute log prefix \"nftables-drop: \" level info"
-    echo "    }"
-    echo
-    echo "    chain forward {"
-    echo "        type filter hook forward priority 0; policy drop;"
-    echo "    }"
-    echo
-    echo "    chain output {"
-    echo "        type filter hook output priority 0; policy accept;"
-    echo "    }"
-    
-    if [ ${#NAT_RULES[@]} -gt 0 ]; then
-        echo
-        echo "    chain prerouting {"
-        echo "        type nat hook prerouting priority -100;"
-        for rule in "${NAT_RULES[@]}"; do
-            local port_range=$(split_nat_rule "$rule" "->" "1")
-            local target_port=$(split_nat_rule "$rule" "->" "2")
-            local start_port=$(echo "$port_range" | cut -d'-' -f1)
-            local end_port=$(echo "$port_range" | cut -d'-' -f2)
-            echo "        tcp dport $start_port-$end_port dnat to :$target_port"
-            echo "        udp dport $start_port-$end_port dnat to :$target_port"
-        done
-        echo "    }"
-    fi
-    
-    echo "}"
-}
-
-# 验证端口转发功能
-verify_port_hopping() {
-    if [ ${#NAT_RULES[@]} -gt 0 ]; then
-        info "验证端口转发配置..."
-        
-        echo -e "\n${CYAN}🔍 当前 NAT 规则状态:${RESET}"
-        if command -v nft >/dev/null 2>&1 && nft list table inet "$NFTABLES_TABLE" >/dev/null 2>&1; then
-            nft list chain inet "$NFTABLES_TABLE" prerouting 2>/dev/null | grep dnat || echo "无 NAT 规则"
-        fi
-        
-        echo -e "\n${YELLOW}💡 端口转发使用说明:${RESET}"
-        echo -e "  - 客户端可以连接到范围内的任意端口"
-        echo -e "  - 所有连接都会转发到目标端口"
-        echo -e "  - 示例：范围内端口的连接转发到目标端口"
-        
-        local checked_ports=()
-        for rule in "${NAT_RULES[@]}"; do
-            local port_range=$(split_nat_rule "$rule" "->" "1")
-            local target_port=$(split_nat_rule "$rule" "->" "2")
-            
-            debug_log "验证规则: $port_range -> $target_port"
-            
-            if [ -n "$target_port" ]; then
-                if [[ ! " ${checked_ports[*]} " =~ " $target_port " ]]; then
-                    checked_ports+=("$target_port")
-                    
-                    if ss -tlnp 2>/dev/null | grep -q ":$target_port "; then
-                        echo -e "  ${GREEN}✓ 目标端口 $target_port 正在监听${RESET}"
-                    else
-                        echo -e "  ${YELLOW}⚠️  目标端口 $target_port 未在监听${RESET}"
-                        echo -e "    ${YELLOW}提示: 请确保代理服务在端口 $target_port 上运行${RESET}"
-                    fi
-                fi
-            else
-                echo -e "  ${RED}❌ 无法解析规则: $rule${RESET}"
-            fi
-        done
-        
-        echo -e "\n${CYAN}📝 端口转发规则摘要:${RESET}"
-        local unique_rules=($(printf '%s\n' "${NAT_RULES[@]}" | sort -u))
-        for rule in "${unique_rules[@]}"; do
-            local port_range=$(split_nat_rule "$rule" "->" "1")
-            local target_port=$(split_nat_rule "$rule" "->" "2")
-            echo -e "  ${CYAN}• 端口范围 $port_range → 目标端口 $target_port${RESET}"
-        done
-    fi
-}
-
-# 重置防火墙
-reset_firewall() {
-    echo -e "${YELLOW}🔄 重置防火墙到默认状态${RESET}"
-    
-    if [ "$DRY_RUN" = false ]; then
-        echo -e "${RED}警告: 这将清除所有 nftables 规则！${RESET}"
-        echo -e "${YELLOW}确认重置防火墙吗？[y/N]${RESET}"
-        read -r response
-        if [[ ! "$response" =~ ^[Yy]([eE][sS])?$ ]]; then
-            info "重置操作已取消"
-            return 0
-        fi
-    fi
-    
-    info "重置 nftables 规则..."
-    
-    if [ "$DRY_RUN" = false ]; then
-        # 删除代理防火墙表
-        if nft list table inet "$NFTABLES_TABLE" >/dev/null 2>&1; then
-            nft delete table inet "$NFTABLES_TABLE" 2>/dev/null || true
-        fi
-        
-        # 清除所有规则集（谨慎操作）
-        echo -e "${YELLOW}是否要清除所有 nftables 规则？这可能影响其他服务 [y/N]${RESET}"
-        read -r response
-        if [[ "$response" =~ ^[Yy]([eE][sS])?$ ]]; then
-            nft flush ruleset
-        fi
-        
-        # 清理服务文件
-        if [ -f "/etc/systemd/system/nftables-proxy.service" ]; then
-            systemctl disable nftables-proxy.service >/dev/null 2>&1 || true
-            rm -f /etc/systemd/system/nftables-proxy.service
-        fi
-        
-        success "防火墙已重置到默认状态"
-    else
-        info "[预览模式] 将重置所有 nftables 规则"
-    fi
-}
-
-# 显示防火墙状态
-show_firewall_status() {
-    echo -e "${CYAN}🔍 当前防火墙状态${RESET}"
-    echo
-    
-    if ! nft list table inet "$NFTABLES_TABLE" >/dev/null 2>&1; then
-        echo -e "${YELLOW}⚠️  代理防火墙表不存在${RESET}"
-        echo -e "${CYAN}当前所有 nftables 表:${RESET}"
-        nft list tables 2>/dev/null || echo "无表"
-        return 0
-    fi
-    
-    echo -e "${GREEN}📊 nftables 规则统计:${RESET}"
-    local input_rules=$(nft list chain inet "$NFTABLES_TABLE" input 2>/dev/null | grep -c "accept\|drop\|log" || echo "0")
-    local nat_rules=$(nft list chain inet "$NFTABLES_TABLE" prerouting 2>/dev/null | grep -c "dnat" || echo "0")
-    echo -e "  INPUT 规则数: $input_rules"
-    echo -e "  NAT 规则数: $nat_rules"
-    echo
-    
-    echo -e "${GREEN}🔓 开放的端口:${RESET}"
-    nft list chain inet "$NFTABLES_TABLE" input 2>/dev/null | grep "dport.*accept" | while read -r line; do
-        if echo "$line" | grep -qE "tcp dport [0-9]+"; then
-            local port=$(echo "$line" | grep -oE "dport [0-9]+" | awk '{print $2}')
-            echo -e "  • $port (tcp)"
-        elif echo "$line" | grep -qE "udp dport [0-9]+"; then
-            local port=$(echo "$line" | grep -oE "dport [0-9]+" | awk '{print $2}')
-            echo -e "  • $port (udp)"
-        elif echo "$line" | grep -qE "dport [0-9]+-[0-9]+"; then
-            local port_range=$(echo "$line" | grep -oE "dport [0-9]+-[0-9]+" | awk '{print $2}')
-            local protocol="tcp/udp"
-            if echo "$line" | grep -q "tcp"; then
-                protocol="tcp"
-            elif echo "$line" | grep -q "udp"; then
-                protocol="udp"
-            fi
-            echo -e "  • $port_range ($protocol) - 端口范围"
-        fi
-    done
-    echo
-    
-    echo -e "${GREEN}🔄 端口转发规则:${RESET}"
-    local nat_count=0
-    if nft list chain inet "$NFTABLES_TABLE" prerouting >/dev/null 2>&1; then
-        while read -r line; do
-            if echo "$line" | grep -q "dnat"; then
-                nat_count=$((nat_count + 1))
-                local port_range=""
-                local target=""
-                
-                if echo "$line" | grep -qE "dport [0-9]+-[0-9]+"; then
-                    port_range=$(echo "$line" | grep -oE "dport [0-9]+-[0-9]+" | awk '{print $2}')
-                fi
-                
-                if echo "$line" | grep -qE ":[0-9]+"; then
-                    target=$(echo "$line" | grep -oE ":[0-9]+" | sed 's/://')
-                fi
-                
-                if [ -n "$port_range" ] && [ -n "$target" ]; then
-                    local protocol="tcp/udp"
-                    if echo "$line" | grep -q "tcp"; then
-                        protocol="tcp"
-                    elif echo "$line" | grep -q "udp"; then
-                        protocol="udp"
-                    fi
-                    echo -e "  • $port_range → $target ($protocol)"
-                fi
-            fi
-        done <<< "$(nft list chain inet "$NFTABLES_TABLE" prerouting 2>/dev/null)"
-    fi
-    
-    if [ "$nat_count" -eq 0 ]; then
-        echo -e "  ${YELLOW}无端口转发规则${RESET}"
-    fi
-    echo
-    
-    echo -e "${GREEN}🛡️  SSH 保护状态:${RESET}"
-    if nft list chain inet "$NFTABLES_TABLE" input 2>/dev/null | grep -q "limit"; then
-        echo -e "  ${GREEN}✓ SSH 暴力破解防护已启用${RESET}"
-    else
-        echo -e "  ${YELLOW}⚠️  SSH 暴力破解防护未启用${RESET}"
-    fi
-    echo
-    
-    echo -e "${GREEN}🔧 WARP 检测状态:${RESET}"
-    local warp_detected=false
-    for warp_port in "${WARP_COMMON_PORTS[@]}"; do
-        if nft list chain inet "$NFTABLES_TABLE" input 2>/dev/null | grep -q "dport $warp_port"; then
-            echo -e "  ${GREEN}✓ WARP 端口 $warp_port 已开放${RESET}"
-            warp_detected=true
-        fi
-    done
-    if [ "$warp_detected" = false ]; then
-        echo -e "  ${YELLOW}⚠️  未检测到 WARP 端口${RESET}"
-    fi
-    echo
-    
-    echo -e "${CYAN}🔧 管理命令:${RESET}"
-    echo -e "  ${YELLOW}查看所有规则:${RESET} nft list ruleset"
-    echo -e "  ${YELLOW}查看代理表:${RESET} nft list table inet $NFTABLES_TABLE"
-    echo -e "  ${YELLOW}查看 NAT 规则:${RESET} nft list chain inet $NFTABLES_TABLE prerouting"
-    echo -e "  ${YELLOW}查看监听端口:${RESET} ss -tlnp"
-    echo -e "  ${YELLOW}重新配置:${RESET} bash $0"
-    echo -e "  ${YELLOW}添加端口转发:${RESET} bash $0 --add-range"
-    echo -e "  ${YELLOW}手动添加端口:${RESET} bash $0 --add-port"
-    echo -e "  ${YELLOW}重置防火墙:${RESET} bash $0 --reset"
-}
-
-# 显示最终状态
-show_final_status() {
-    echo -e "\n${GREEN}=================================="
-    echo -e "🎉 nftables 防火墙配置完成！"
-    echo -e "==================================${RESET}"
-    
-    echo -e "\n${CYAN}📊 配置摘要:${RESET}"
-    echo -e "  ${GREEN}✓ 开放端口数: $OPENED_PORTS${RESET}"
-    echo -e "  ${GREEN}✓ SSH 端口: $SSH_PORT (已保护)${RESET}"
-    echo -e "  ${GREEN}✓ 防火墙引擎: nftables${RESET}"
-    echo -e "  ${GREEN}✓ 防火墙表: $NFTABLES_TABLE${RESET}"
-    echo -e "  ${GREEN}✓ 内部服务保护: 已启用${RESET}"
-    echo -e "  ${GREEN}✓ 默认端口: 80, 443 (永久开放)${RESET}"
-    echo -e "  ${GREEN}✓ WARP 支持: 已启用${RESET}"
-    if [ ${#NAT_RULES[@]} -gt 0 ]; then
-        local unique_nat_rules=($(printf '%s\n' "${NAT_RULES[@]}" | sort -u))
-        echo -e "  ${GREEN}✓ 端口转发规则: ${#unique_nat_rules[@]} 条${RESET}"
-    fi
-    
-    if [ ${#DETECTED_PORTS[@]} -gt 0 ]; then
-        echo -e "\n${GREEN}🔓 已开放端口:${RESET}"
-        for port in "${DETECTED_PORTS[@]}"; do
-            if [[ " ${DEFAULT_OPEN_PORTS[*]} " =~ " $port " ]]; then
-                echo -e "  ${GREEN}• $port (TCP/UDP) - 默认开放${RESET}"
-            elif [[ " ${WARP_COMMON_PORTS[*]} " =~ " $port " ]]; then
-                echo -e "  ${GREEN}• $port (TCP/UDP) - WARP 端口${RESET}"
-            else
-                echo -e "  ${GREEN}• $port (TCP/UDP)${RESET}"
-            fi
-        done
-    fi
-    
-    if [ ${#NAT_RULES[@]} -gt 0 ]; then
-        echo -e "\n${CYAN}🔄 端口转发规则:${RESET}"
-        local unique_rules=($(printf '%s\n' "${NAT_RULES[@]}" | sort -u))
-        for rule in "${unique_rules[@]}"; do
-            local port_range=$(split_nat_rule "$rule" "->" "1")
-            local target_port=$(split_nat_rule "$rule" "->" "2")
-            echo -e "  ${CYAN}• $port_range → $target_port${RESET}"
-        done
-    fi
-    
-    if [ "$DRY_RUN" = true ]; then
-        echo -e "\n${CYAN}🔍 这是预览模式，防火墙实际未被修改${RESET}"
-        return 0
-    fi
-    
-    echo -e "\n${CYAN}🔧 管理命令:${RESET}"
-    echo -e "  ${YELLOW}查看所有规则:${RESET} nft list ruleset"
-    echo -e "  ${YELLOW}查看代理表:${RESET} nft list table inet $NFTABLES_TABLE"
-    echo -e "  ${YELLOW}查看监听端口:${RESET} ss -tlnp"
-    echo -e "  ${YELLOW}查看 NAT 规则:${RESET} nft list chain inet $NFTABLES_TABLE prerouting"
-    echo -e "  ${YELLOW}查看状态:${RESET} bash $0 --status"
-    echo -e "  ${YELLOW}添加端口转发:${RESET} bash $0 --add-range"
-    echo -e "  ${YELLOW}手动添加端口:${RESET} bash $0 --add-port"
-    echo -e "  ${YELLOW}重置防火墙:${RESET} bash $0 --reset"
-    
-    echo -e "\n${GREEN}✅ 代理端口精确开放，端口转发已配置，WARP 支持已启用，内部服务受保护，服务器安全已启用！${RESET}"
-    
-    if [ ${#NAT_RULES[@]} -gt 0 ]; then
-        local has_unlistened=false
-        local checked_ports=()
-        
-        for rule in "${NAT_RULES[@]}"; do
-            local target_port=$(split_nat_rule "$rule" "->" "2")
-            if [ -n "$target_port" ] && [[ ! " ${checked_ports[*]} " =~ " $target_port " ]]; then
-                checked_ports+=("$target_port")
-                if ! ss -tlnp 2>/dev/null | grep -q ":$target_port "; then
-                    has_unlistened=true
-                    break
-                fi
-            fi
-        done
-        
-        if [ "$has_unlistened" = true ]; then
-            echo -e "\n${YELLOW}⚠️  提醒: 某些端口转发目标端口未在监听${RESET}"
-            echo -e "${YELLOW}   请确保相关代理服务正在运行，否则端口转发可能无法工作${RESET}"
-        fi
-    fi
-    
-    # 显示 nftables 服务状态
-    if command -v systemctl >/dev/null 2>&1; then
-        if systemctl is-enabled nftables >/dev/null 2>&1; then
-            echo -e "\n${GREEN}✅ nftables 服务已启用，规则将在重启后自动恢复${RESET}"
-        else
-            echo -e "\n${YELLOW}⚠️  建议启用 nftables 服务以确保规则持久化:${RESET}"
-            echo -e "${YELLOW}   systemctl enable nftables${RESET}"
-        fi
-    fi
-}
-
-# 主函数
-main() {
-    trap 'echo -e "\n${RED}操作被中断${RESET}"; exit 130' INT TERM
-    
-    parse_arguments "$@"
-    
-    echo -e "\n${CYAN}🚀 开始智能代理端口检测和配置...${RESET}"
-    
-    check_system
-    detect_ssh_port
-    detect_existing_nat_rules
-    cleanup_firewalls
-    
-    # 检测 WARP 服务
-    detect_warp_service
-    
-    if ! detect_proxy_processes; then
-        warning "建议在运行此脚本之前启动代理服务以获得最佳效果"
-    fi
-    
-    parse_config_ports
-    detect_listening_ports
-    
-    if ! filter_and_confirm_ports; then
-        info "添加 Hiddify 常用端口作为备用..."
-        DETECTED_PORTS=("${HIDDIFY_COMMON_PORTS[@]}")
-        if ! filter_and_confirm_ports; then
-            error_exit "无法确定要开放的端口"
-        fi
-    fi
-    
-    apply_firewall_rules
-    verify_port_hopping
-    show_final_status
-}
-
-# 脚本入口点
-main "$@"
