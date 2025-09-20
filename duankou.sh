@@ -349,40 +349,39 @@ detect_existing_nat_rules() {
     
     local nat_rules=()
     
-    if command -v nft >/dev/null 2>&1; then
+    if command -v nft >/dev/null 2>&1 && nft list table inet "$NFTABLES_TABLE" >/dev/null 2>&1; then
         debug_log "扫描 nftables DNAT 规则..."
         
-        # 获取所有表的 DNAT 规则
-        local tables=$(nft list tables 2>/dev/null | awk '{print $3}' | grep -v '^$' || true)
-        
-        for table in $tables; do
-            while IFS= read -r line; do
-                if [[ "$line" =~ dnat && "$line" =~ "dport" ]]; then
-                    debug_log "分析 nftables 规则: $line"
-                    
-                    local port_range=""
-                    local target_port=""
-                    
-                    # 提取端口范围
-                    if echo "$line" | grep -qE "dport [0-9]+-[0-9]+"; then
-                        port_range=$(echo "$line" | grep -oE "dport [0-9]+-[0-9]+" | awk '{print $2}')
-                    elif echo "$line" | grep -qE "dport \{[0-9]+[,-][0-9]+\}"; then
-                        port_range=$(echo "$line" | grep -oE "dport \{[0-9]+[,-][0-9]+\}" | sed 's/dport {//' | sed 's/}//' | sed 's/,/-/')
-                    fi
-                    
-                    # 提取目标端口
-                    if echo "$line" | grep -qE ":[0-9]+"; then
-                        target_port=$(echo "$line" | grep -oE ":[0-9]+" | tail -1 | sed 's/://')
-                    fi
-                    
-                    if [ -n "$port_range" ] && [ -n "$target_port" ]; then
-                        local rule_key="$port_range->$target_port"
+        # 获取现有的 DNAT 规则，避免重复
+        while IFS= read -r line; do
+            if [[ "$line" =~ dnat && "$line" =~ "dport" ]]; then
+                debug_log "分析 nftables 规则: $line"
+                
+                local port_range=""
+                local target_port=""
+                
+                # 提取端口范围
+                if echo "$line" | grep -qE "dport [0-9]+-[0-9]+"; then
+                    port_range=$(echo "$line" | grep -oE "dport [0-9]+-[0-9]+" | awk '{print $2}')
+                elif echo "$line" | grep -qE "dport \{[0-9]+[,-][0-9]+\}"; then
+                    port_range=$(echo "$line" | grep -oE "dport \{[0-9]+[,-][0-9]+\}" | sed 's/dport {//' | sed 's/}//' | sed 's/,/-/')
+                fi
+                
+                # 提取目标端口
+                if echo "$line" | grep -qE ":[0-9]+"; then
+                    target_port=$(echo "$line" | grep -oE ":[0-9]+" | tail -1 | sed 's/://')
+                fi
+                
+                if [ -n "$port_range" ] && [ -n "$target_port" ]; then
+                    local rule_key="$port_range->$target_port"
+                    # 检查规则是否已存在，避免重复
+                    if [[ ! " ${nat_rules[*]} " =~ " ${rule_key} " ]]; then
                         nat_rules+=("$rule_key")
                         debug_log "发现 nftables 端口转发规则: $port_range -> $target_port"
                     fi
                 fi
-            done <<< "$(nft list table "$table" 2>/dev/null || true)"
-        done
+            fi
+        done <<< "$(nft list chain inet "$NFTABLES_TABLE" prerouting 2>/dev/null || true)"
     fi
     
     if [ ${#nat_rules[@]} -gt 0 ]; then
@@ -395,14 +394,26 @@ detect_existing_nat_rules() {
                 DETECTED_PORTS+=("$target_port")
             fi
         done
-    fi
-    
-    if [ ${#NAT_RULES[@]} -gt 0 ]; then
+        
         echo -e "\n${GREEN}🔄 检测到现有端口转发规则:${RESET}"
         for rule in "${NAT_RULES[@]}"; do
             echo -e "  ${GREEN}• $rule${RESET}"
         done
         success "检测到 ${#NAT_RULES[@]} 条端口转发规则"
+        
+        # 如果检测到现有规则，询问是否要保持现有配置
+        if [ "$DRY_RUN" = false ]; then
+            echo -e "\n${YELLOW}检测到现有端口转发配置，是否保持现有规则？[Y/n]${RESET}"
+            read -r response
+            if [[ "$response" =~ ^[Yy]?$ ]]; then
+                info "保持现有端口转发规则，跳过自动检测"
+                return 0
+            else
+                info "将清除现有规则并重新配置"
+                NAT_RULES=()
+                DETECTED_PORTS=()
+            fi
+        fi
     else
         info "未检测到现有端口转发规则"
     fi
@@ -539,6 +550,12 @@ apply_single_port_rule() {
         setup_nftables_base
     fi
     
+    # 检查端口规则是否已存在
+    if nft list chain inet "$NFTABLES_TABLE" input 2>/dev/null | grep -q "dport $port accept"; then
+        warning "端口规则已存在: $port"
+        return 0
+    fi
+    
     # 添加端口规则
     nft add rule inet "$NFTABLES_TABLE" input tcp dport "$port" accept 2>/dev/null || true
     nft add rule inet "$NFTABLES_TABLE" input udp dport "$port" accept 2>/dev/null || true
@@ -557,6 +574,12 @@ apply_single_nat_rule() {
     
     local start_port=$(echo "$port_range" | cut -d'-' -f1)
     local end_port=$(echo "$port_range" | cut -d'-' -f2)
+    
+    # 检查规则是否已存在
+    if nft list chain inet "$NFTABLES_TABLE" prerouting 2>/dev/null | grep -q "dport $start_port-$end_port.*dnat.*:$target_port"; then
+        warning "端口转发规则已存在: $port_range -> $target_port"
+        return 0
+    fi
     
     # 添加 DNAT 规则
     nft add rule inet "$NFTABLES_TABLE" prerouting tcp dport "$start_port-$end_port" dnat to ":$target_port" 2>/dev/null || true
@@ -1023,17 +1046,19 @@ apply_firewall_rules() {
     # SSH 保护
     setup_ssh_protection
     
-    # 开放代理端口（TCP 和 UDP）
-    for port in "${DETECTED_PORTS[@]}"; do
+    # 开放代理端口（TCP 和 UDP）- 去重处理
+    local unique_ports=($(printf '%s\n' "${DETECTED_PORTS[@]}" | sort -nu))
+    for port in "${unique_ports[@]}"; do
         nft add rule inet "$NFTABLES_TABLE" input tcp dport "$port" accept
         nft add rule inet "$NFTABLES_TABLE" input udp dport "$port" accept
         debug_log "开放端口: $port (TCP/UDP)"
     done
     
-    # 应用 NAT 规则（端口转发）
+    # 应用 NAT 规则（端口转发）- 避免重复规则
     if [ ${#NAT_RULES[@]} -gt 0 ]; then
         info "应用端口转发规则..."
-        for rule in "${NAT_RULES[@]}"; do
+        local unique_nat_rules=($(printf '%s\n' "${NAT_RULES[@]}" | sort -u))
+        for rule in "${unique_nat_rules[@]}"; do
             local port_range=$(split_nat_rule "$rule" "->" "1")
             local target_port=$(split_nat_rule "$rule" "->" "2")
             
@@ -1041,16 +1066,25 @@ apply_firewall_rules() {
                 local start_port=$(echo "$port_range" | cut -d'-' -f1)
                 local end_port=$(echo "$port_range" | cut -d'-' -f2)
                 
-                # 添加 DNAT 规则
-                nft add rule inet "$NFTABLES_TABLE" prerouting udp dport "$start_port-$end_port" dnat to ":$target_port"
-                nft add rule inet "$NFTABLES_TABLE" prerouting tcp dport "$start_port-$end_port" dnat to ":$target_port"
+                # 检查规则是否已存在，避免重复添加
+                local rule_exists=false
+                if nft list chain inet "$NFTABLES_TABLE" prerouting 2>/dev/null | grep -q "dport $start_port-$end_port.*dnat.*:$target_port"; then
+                    rule_exists=true
+                    debug_log "端口转发规则已存在，跳过: $port_range -> $target_port"
+                fi
                 
-                # 开放端口范围
-                nft add rule inet "$NFTABLES_TABLE" input tcp dport "$start_port-$end_port" accept
-                nft add rule inet "$NFTABLES_TABLE" input udp dport "$start_port-$end_port" accept
-                
-                success "应用端口转发: $port_range -> $target_port"
-                debug_log "NAT 规则: $start_port-$end_port -> $target_port"
+                if [ "$rule_exists" = false ]; then
+                    # 添加 DNAT 规则
+                    nft add rule inet "$NFTABLES_TABLE" prerouting udp dport "$start_port-$end_port" dnat to ":$target_port"
+                    nft add rule inet "$NFTABLES_TABLE" prerouting tcp dport "$start_port-$end_port" dnat to ":$target_port"
+                    
+                    # 开放端口范围
+                    nft add rule inet "$NFTABLES_TABLE" input tcp dport "$start_port-$end_port" accept
+                    nft add rule inet "$NFTABLES_TABLE" input udp dport "$start_port-$end_port" accept
+                    
+                    success "应用端口转发: $port_range -> $target_port"
+                    debug_log "NAT 规则: $start_port-$end_port -> $target_port"
+                fi
             else
                 warning "无法解析 NAT 规则: $rule"
             fi
@@ -1060,7 +1094,7 @@ apply_firewall_rules() {
     # 记录并丢弃其他连接（限制日志频率）
     nft add rule inet "$NFTABLES_TABLE" input limit rate 3/minute log prefix "nftables-drop: " level info
     
-    OPENED_PORTS=${#DETECTED_PORTS[@]}
+    OPENED_PORTS=${#unique_ports[@]}
     success "nftables 规则应用成功"
     
     # 保存规则
