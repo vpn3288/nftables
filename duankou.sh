@@ -967,10 +967,10 @@ setup_nftables_base() {
     nft add table inet "$NFTABLES_TABLE" 2>/dev/null || true
     
     # 创建链
-    nft add chain inet "$NFTABLES_TABLE" input { type filter hook input priority 0\; policy drop\; } 2>/dev/null || true
-    nft add chain inet "$NFTABLES_TABLE" forward { type filter hook forward priority 0\; policy drop\; } 2>/dev/null || true
-    nft add chain inet "$NFTABLES_TABLE" output { type filter hook output priority 0\; policy accept\; } 2>/dev/null || true
-    nft add chain inet "$NFTABLES_TABLE" prerouting { type nat hook prerouting priority -100\; } 2>/dev/null || true
+    nft add chain inet "$NFTABLES_TABLE" input '{ type filter hook input priority 0; policy drop; }' 2>/dev/null || true
+    nft add chain inet "$NFTABLES_TABLE" forward '{ type filter hook forward priority 0; policy drop; }' 2>/dev/null || true
+    nft add chain inet "$NFTABLES_TABLE" output '{ type filter hook output priority 0; policy accept; }' 2>/dev/null || true
+    nft add chain inet "$NFTABLES_TABLE" prerouting '{ type nat hook prerouting priority -100; }' 2>/dev/null || true
     
     # 清空现有规则
     nft flush chain inet "$NFTABLES_TABLE" input 2>/dev/null || true
@@ -1058,7 +1058,7 @@ apply_firewall_rules() {
     fi
     
     # 记录并丢弃其他连接（限制日志频率）
-    nft add rule inet "$NFTABLES_TABLE" input limit rate 3/minute log prefix \"nftables-drop: \" level info
+    nft add rule inet "$NFTABLES_TABLE" input limit rate 3/minute log prefix "nftables-drop: " level info
     
     OPENED_PORTS=${#DETECTED_PORTS[@]}
     success "nftables 规则应用成功"
@@ -1146,7 +1146,7 @@ show_rules_preview() {
         done
     fi
     
-    echo "        limit rate 3/minute log prefix \"nftables-drop: \" level info"
+            echo "        limit rate 3/minute log prefix \"nftables-drop: \" level info"
     echo "    }"
     echo
     echo "    chain forward {"
