@@ -2,11 +2,11 @@
 基本使用
 bash <(curl -sSL https://raw.githubusercontent.com/vpn3288/nftables/refs/heads/main/duankou.sh)
 
-预演模式
+# 预览模式（推荐首次使用）
 bash <(curl -sSL https://raw.githubusercontent.com/vpn3288/nftables/refs/heads/main/duankou.sh) --dry-run
 
-查看状态
-bash <(curl -sSL https://raw.githubusercontent.com/vpn3288/nftables/refs/heads/main/duankou.sh) --status
+# 自动模式（无交互）
+bash <(curl -sSL https://raw.githubusercontent.com/vpn3288/nftables/refs/heads/main/duankou.sh) --auto
 
-添加端口跳跃
-bash <(curl -sSL https://raw.githubusercontent.com/vpn3288/nftables/refs/heads/main/duankou.sh) --add-range
+# 调试模式
+bash <(curl -sSL https://raw.githubusercontent.com/vpn3288/nftables/refs/heads/main/duankou.sh) --debug
