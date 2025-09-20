@@ -879,24 +879,21 @@ cleanup_firewalls() {
         ufw --force reset >/dev/null 2>&1 || true
     fi
     
-    # 备份重要信息（如果需要的话）
-    info "备份现有配置信息..."
-    local backup_dir="/tmp/firewall_backup_$(date +%Y%m%d_%H%M%S)"
-    mkdir -p "$backup_dir"
+    # 备份现有NAT规则到临时文件（不删除用户配置）
+    local nat_backup="/tmp/nat_rules_backup_$(date +%Y%m%d_%H%M%S).txt"
+    info "备份现有NAT规则到 $nat_backup"
     
-    # 备份当前nftables规则（仅作记录，不用于恢复）
+    # 备份nftables规则
     if command -v nft >/dev/null 2>&1; then
-        nft list ruleset > "$backup_dir/nftables_rules.backup" 2>/dev/null || true
+        nft list ruleset > "$nat_backup.nft" 2>/dev/null || true
     fi
     
-    # 备份当前iptables规则（仅作记录，不用于恢复）
+    # 备份iptables规则  
     if command -v iptables-save >/dev/null 2>&1; then
-        iptables-save > "$backup_dir/iptables_rules.backup" 2>/dev/null || true
+        iptables-save > "$nat_backup.ipt" 2>/dev/null || true
     fi
     
-    debug_log "规则备份已保存到: $backup_dir"
-    
-    # 清理所有 nftables 规则
+    # 清理所有 nftables 规则（但保留检测到的NAT规则信息在内存中）
     info "清理所有 nftables 防火墙规则..."
     nft flush ruleset 2>/dev/null || true
     
@@ -935,7 +932,8 @@ cleanup_firewalls() {
     fi
     
     success "所有防火墙规则清理完成"
-    info "注意: 只清理了防火墙规则，未删除任何代理软件配置文件"
+    info "重要提示: 已保存现有NAT规则到内存，将在新防火墙中恢复"
+    info "备份文件: $nat_backup.*"
 }
 
 # 创建 nftables 基础结构
@@ -1445,8 +1443,9 @@ main() {
     
     check_system
     detect_ssh_port
+    
+    # 在清理防火墙之前检测现有的NAT规则
     detect_existing_nat_rules
-    cleanup_firewalls
     
     if ! detect_proxy_processes; then
         warning "建议在运行此脚本之前启动代理服务以获得最佳效果"
@@ -1462,6 +1461,9 @@ main() {
             error_exit "无法确定要开放的端口"
         fi
     fi
+    
+    # 在检测完所有端口和NAT规则后再清理防火墙
+    cleanup_firewalls
     
     apply_firewall_rules
     verify_port_hopping
