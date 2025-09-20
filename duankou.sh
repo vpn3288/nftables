@@ -10,7 +10,7 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 # 脚本信息
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.1.1"
 SCRIPT_NAME="精确代理端口防火墙管理脚本（nftables 版本）"
 
 echo -e "${YELLOW}== 🚀 ${SCRIPT_NAME} v${SCRIPT_VERSION} ==${RESET}"
@@ -158,10 +158,9 @@ split_nat_rule() {
     fi
 }
 
-# 显示帮助信息
 show_help() {
-    cat << 'EOF'
-精确代理端口防火墙管理脚本 v2.1.0（nftables 版本）
+    cat << 'HELPEOF'
+精确代理端口防火墙管理脚本 v2.1.1（nftables 版本）
 
 为现代代理面板设计的智能端口管理工具
 
@@ -195,7 +194,7 @@ show_help() {
     ✓ 现代化 nftables 防火墙
     ✓ WARP 端口自动检测
 
-EOF
+HELPEOF
 }
 
 # 解析参数
@@ -1128,7 +1127,7 @@ save_nftables_rules() {
     
     # 创建服务文件以确保规则持久化
     if command -v systemctl >/dev/null 2>&1; then
-        cat > /etc/systemd/system/nftables-proxy.service << 'EOF'
+        cat > /etc/systemd/system/nftables-proxy.service << 'SERVICEEOF'
 [Unit]
 Description=恢复代理防火墙 nftables 规则
 After=network-pre.target
@@ -1137,14 +1136,15 @@ Wants=network-pre.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/nft -f CONFIG_FILE_PLACEHOLDER
+ExecStart=/usr/sbin/nft -f CONFIGFILE
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
-EOF
+SERVICEEOF
+        
         # 替换配置文件路径
-        sed -i "s|CONFIG_FILE_PLACEHOLDER|$config_file|g" /etc/systemd/system/nftables-proxy.service
+        sed -i "s|CONFIGFILE|${config_file}|g" /etc/systemd/system/nftables-proxy.service
         systemctl enable nftables-proxy.service >/dev/null 2>&1 || true
         systemctl enable nftables.service >/dev/null 2>&1 || true
     fi
@@ -1182,7 +1182,7 @@ show_rules_preview() {
         done
     fi
     
-            echo "        limit rate 3/minute log prefix \\\"nftables-drop: \\\" level info"
+            echo "        limit rate 3/minute log prefix \"nftables-drop: \" level info"
     echo "    }"
     echo
     echo "    chain forward {"
