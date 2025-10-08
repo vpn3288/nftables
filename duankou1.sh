@@ -342,12 +342,13 @@ detect_proxy_processes() {
     for process in "${PROXY_CORE_PROCESSES[@]}"; do
         if pgrep -f "$process" >/dev/null 2>&1; then
             found+=("$process")
-            debug_log "发现: $process"
+            debug_log "发现进程: $process"
         fi
     done
     
     if [ ${#found[@]} -gt 0 ]; then
-        success "检测到代理进程: ${found[*]}"
+        local found_list=$(IFS=' '; echo "${found[*]}")
+        success "检测到代理进程: $found_list"
         return 0
     else
         warning "未检测到运行中的代理进程"
