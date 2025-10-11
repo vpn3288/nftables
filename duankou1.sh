@@ -546,54 +546,56 @@ parse_config_ports() {
             debug_log "分析配置文件: $config_file"
             
             if [[ "$config_file" =~ \.json$ ]]; then
+                # 检测端口跳跃配置
+                local file_content=$(cat "$config_file" 2>/dev/null)
+                
+                # 检测多种端口跳跃格式
+                local hop_start=""
+                local hop_end=""
+                local hop_target=""
+                
+                # 格式1: "portHopping": {"start": 16820, "end": 16888}
+                if echo "$file_content" | grep -q "portHopping"; then
+                    hop_start=$(echo "$file_content" | grep -oE '"start"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1)
+                    hop_end=$(echo "$file_content" | grep -oE '"end"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1)
+                fi
+                
+                # 格式2: "port_range": "16820-16888"
+                if [ -z "$hop_start" ]; then
+                    local range=$(echo "$file_content" | grep -oE '"port_range"[[:space:]]*:[[:space:]]*"[0-9]+-[0-9]+"' | grep -oE '[0-9]+-[0-9]+')
+                    if [ -n "$range" ]; then
+                        hop_start=$(echo "$range" | cut -d'-' -f1)
+                        hop_end=$(echo "$range" | cut -d'-' -f2)
+                    fi
+                fi
+                
+                # 格式3: "portRange": "16820-16888"
+                if [ -z "$hop_start" ]; then
+                    local range=$(echo "$file_content" | grep -oE '"portRange"[[:space:]]*:[[:space:]]*"[0-9]+-[0-9]+"' | grep -oE '[0-9]+-[0-9]+')
+                    if [ -n "$range" ]; then
+                        hop_start=$(echo "$range" | cut -d'-' -f1)
+                        hop_end=$(echo "$range" | cut -d'-' -f2)
+                    fi
+                fi
+                
+                # 如果找到端口跳跃配置，查找目标端口
+                if [ -n "$hop_start" ] && [ -n "$hop_end" ]; then
+                    # 查找监听端口作为目标
+                    hop_target=$(echo "$file_content" | grep -oE '"listen_port"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1)
+                    if [ -z "$hop_target" ]; then
+                        hop_target=$(echo "$file_content" | grep -oE '"port"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1)
+                    fi
+                    
+                    if [ -n "$hop_target" ]; then
+                        info "检测到端口跳跃: $hop_start-$hop_end -> $hop_target"
+                        NAT_RULES+=("$hop_start-$hop_end->$hop_target")
+                        DETECTED_PORTS+=("$hop_target")
+                    fi
+                fi
+                
+                # 解析普通端口
                 if command -v jq >/dev/null 2>&1; then
-                    local ports=$(timeout 5 jq -r '.inbounds[]? | select(.listen == null or .listen == "" or .listen == "0.0.0.0" or .listen == "::") | .port' "$config_file" 2>/dev/null | grep -E '^[0-9]+$' | sort -nu || echo "")
-                    if [ -n "$ports" ]; then
-                        while read -r port; do
-                            if ! is_internal_service_port "$port"; then
-                                config_ports+=("$port")
-                                debug_log "从 $config_file 解析端口: $port"
-                            fi
-                        done <<< "$ports"
-                    fi
-                else
-                    # 不使用 jq 的简单解析
-                    local ports=$(grep -oE '"port"[[:space:]]*:[[:space:]]*[0-9]+' "$config_file" 2>/dev/null | grep -oE '[0-9]+' | sort -nu || echo "")
-                    if [ -n "$ports" ]; then
-                        while read -r port; do
-                            if ! is_internal_service_port "$port"; then
-                                config_ports+=("$port")
-                                debug_log "从 $config_file 简单解析端口: $port"
-                            fi
-                        done <<< "$ports"
-                    fi
-                fi
-            elif [[ "$config_file" =~ \.(yaml|yml)$ ]]; then
-                local ports=$(grep -oE 'port[[:space:]]*:[[:space:]]*[0-9]+' "$config_file" 2>/dev/null | grep -oE '[0-9]+' | sort -nu || echo "")
-                if [ -n "$ports" ]; then
-                    while read -r port; do
-                        if ! is_internal_service_port "$port"; then
-                            config_ports+=("$port")
-                            debug_log "从 $config_file 解析 YAML 端口: $port"
-                        fi
-                    done <<< "$ports"
-                fi
-            fi
-        fi
-        
-        # 避免检查过多文件导致卡住
-        if [ $file_count -ge 10 ]; then
-            debug_log "已检查 10 个配置文件，跳过剩余"
-            break
-        fi
-    done
-    
-    if [ ${#config_ports[@]} -gt 0 ]; then
-        local unique_ports=($(printf '%s\n' "${config_ports[@]}" | sort -nu))
-        DETECTED_PORTS+=("${unique_ports[@]}")
-        success "从配置文件解析到 ${#unique_ports[@]} 个端口"
-    fi
-}
+                    local ports=$(timeout 5 jq -r '.inbounds[]? | select(.listen == null or .listen == "" or .listen == "0.0.0.0" or .listen == "::") | .port' "$config_file" 2>/dev/null | grep -E '^[0-9]+
 
 # 检测监听端口
 detect_listening_ports() {
@@ -698,6 +700,922 @@ is_standard_proxy_port() {
         fi
     done
     
+    if [ "$port" -ge 30000 ] && [ "$port" -le 39999 ]; then
+        return 0
+    fi
+    if [ "$port" -ge 40000 ] && [ "$port" -le 65000 ] && ! is_internal_service_port "$port"; then
+        return 0
+    fi
+    
+    return 1
+}
+
+# 检测端口跳跃模式（连续端口）
+detect_port_hopping_pattern() {
+    local ports=("$@")
+    local hopping_ranges=()
+    
+    # 排序端口
+    local sorted_ports=($(printf '%s\n' "${ports[@]}" | sort -n))
+    
+    local range_start=""
+    local range_end=""
+    local prev_port=""
+    
+    for port in "${sorted_ports[@]}"; do
+        if [ -z "$prev_port" ]; then
+            range_start="$port"
+            range_end="$port"
+        elif [ $((prev_port + 1)) -eq "$port" ]; then
+            range_end="$port"
+        else
+            # 如果连续端口超过3个，认为是端口跳跃
+            local range_size=$((range_end - range_start + 1))
+            if [ "$range_size" -ge 3 ]; then
+                hopping_ranges+=("$range_start-$range_end")
+            fi
+            range_start="$port"
+            range_end="$port"
+        fi
+        prev_port="$port"
+    done
+    
+    # 检查最后一个范围
+    if [ -n "$range_start" ]; then
+        local range_size=$((range_end - range_start + 1))
+        if [ "$range_size" -ge 3 ]; then
+            hopping_ranges+=("$range_start-$range_end")
+        fi
+    fi
+    
+    # 返回检测到的端口跳跃范围
+    printf '%s\n' "${hopping_ranges[@]}"
+}
+
+# 端口安全检查
+is_port_safe() {
+    local port="$1"
+    
+    for blacklist_port in "${BLACKLIST_PORTS[@]}"; do
+        if [ "$port" = "$blacklist_port" ]; then
+            debug_log "端口 $port 在黑名单中"
+            return 1
+        fi
+    done
+    
+    if is_internal_service_port "$port"; then
+        debug_log "端口 $port 是内部服务端口"
+        return 1
+    fi
+    
+    if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        debug_log "端口 $port 超出有效范围"
+        return 1
+    fi
+    
+    if [[ " ${DEFAULT_OPEN_PORTS[*]} " =~ " $port " ]]; then
+        debug_log "端口 $port 是默认开放端口"
+        return 0
+    fi
+    
+    return 0
+}
+
+# 过滤并确认端口
+filter_and_confirm_ports() {
+    info "智能端口分析和确认..."
+    
+    info "添加默认开放端口: ${DEFAULT_OPEN_PORTS[*]}"
+    DETECTED_PORTS+=("${DEFAULT_OPEN_PORTS[@]}")
+    
+    local all_ports=($(printf '%s\n' "${DETECTED_PORTS[@]}" | sort -nu))
+    local safe_ports=()
+    local suspicious_ports=()
+    local unsafe_ports=()
+    local internal_ports=()
+    
+    for port in "${all_ports[@]}"; do
+        if ! is_port_safe "$port"; then
+            if is_internal_service_port "$port"; then
+                internal_ports+=("$port")
+            else
+                unsafe_ports+=("$port")
+            fi
+        elif is_standard_proxy_port "$port" || [[ " ${DEFAULT_OPEN_PORTS[*]} " =~ " $port " ]]; then
+            safe_ports+=("$port")
+        else
+            suspicious_ports+=("$port")
+        fi
+    done
+    
+    if [ ${#safe_ports[@]} -gt 0 ]; then
+        echo -e "\n${GREEN}✅ 标准代理端口（推荐）:${RESET}"
+        for port in "${safe_ports[@]}"; do
+            if [[ " ${DEFAULT_OPEN_PORTS[*]} " =~ " $port " ]]; then
+                echo -e "  ${GREEN}✓ $port${RESET} - 默认开放端口"
+            else
+                echo -e "  ${GREEN}✓ $port${RESET} - 常用代理端口"
+            fi
+        done
+    fi
+    
+    if [ ${#internal_ports[@]} -gt 0 ]; then
+        echo -e "\n${YELLOW}🔒 内部服务端口（已过滤）:${RESET}"
+        for port in "${internal_ports[@]}"; do
+            echo -e "  ${YELLOW}- $port${RESET} - 内部服务端口，不暴露"
+        done
+    fi
+    
+    if [ ${#suspicious_ports[@]} -gt 0 ]; then
+        echo -e "\n${YELLOW}⚠️  可疑端口（需要确认）:${RESET}"
+        for port in "${suspicious_ports[@]}"; do
+            echo -e "  ${YELLOW}? $port${RESET} - 非标准代理端口"
+        done
+        
+        echo -e "\n${YELLOW}这些端口可能不是必要的代理端口${RESET}"
+        
+        if [ "$DRY_RUN" = false ] && [ "$AUTO_MODE" = false ]; then
+            read_with_timeout "${YELLOW}也要开放这些可疑端口吗？[y/N]${RESET}" 15 "N"
+            if [[ "$REPLY" =~ ^[Yy]([eE][sS])?$ ]]; then
+                safe_ports+=("${suspicious_ports[@]}")
+                info "用户确认开放可疑端口"
+            else
+                info "跳过可疑端口"
+            fi
+        fi
+    fi
+    
+    if [ ${#unsafe_ports[@]} -gt 0 ]; then
+        echo -e "\n${RED}❌ 危险端口（已跳过）:${RESET}"
+        for port in "${unsafe_ports[@]}"; do
+            echo -e "  ${RED}✗ $port${RESET} - 系统端口或危险端口"
+        done
+    fi
+    
+    if [ "$DRY_RUN" = false ] && [ ${#NAT_RULES[@]} -eq 0 ] && [ "$AUTO_MODE" = false ]; then
+        read_with_timeout "\n${CYAN}🔄 配置端口转发功能吗？[y/N]${RESET}\n${YELLOW}端口转发可以将端口范围重定向到单个目标端口${RESET}" 15 "N"
+        if [[ "$REPLY" =~ ^[Yy]([eE][sS])?$ ]]; then
+            add_port_range_interactive
+        fi
+    fi
+    
+    if [ ${#safe_ports[@]} -eq 0 ]; then
+        warning "未检测到标准代理端口"
+        safe_ports=("${DEFAULT_OPEN_PORTS[@]}")
+    fi
+    
+    if [ "$DRY_RUN" = false ] && [ "$AUTO_MODE" = false ]; then
+        echo -e "\n${CYAN}📋 最终要开放的端口:${RESET}"
+        for port in "${safe_ports[@]}"; do
+            if [[ " ${DEFAULT_OPEN_PORTS[*]} " =~ " $port " ]]; then
+                echo -e "  ${CYAN}• $port${RESET} (默认开放)"
+            else
+                echo -e "  ${CYAN}• $port${RESET}"
+            fi
+        done
+        
+        if [ ${#NAT_RULES[@]} -gt 0 ]; then
+            echo -e "\n${CYAN}🔄 端口转发规则:${RESET}"
+            for rule in "${NAT_RULES[@]}"; do
+                echo -e "  ${CYAN}• $rule${RESET}"
+            done
+        fi
+        
+        echo -e "\n${YELLOW}确认开放 ${#safe_ports[@]} 个端口"
+        if [ ${#NAT_RULES[@]} -gt 0 ]; then
+            echo -e "和 ${#NAT_RULES[@]} 条端口转发规则"
+        fi
+        echo -e "吗？[Y/n]${RESET}"
+        
+        read_with_timeout "" 15 "Y"
+        if [[ ! "$REPLY" =~ ^[Yy]?$ ]]; then
+            info "用户取消操作"
+            exit 0
+        fi
+    fi
+    
+    DETECTED_PORTS=($(printf '%s\n' "${safe_ports[@]}" | sort -nu))
+    return 0
+}
+
+# 清理现有防火墙
+cleanup_firewalls() {
+    info "清理现有防火墙配置..."
+    
+    if [ "$DRY_RUN" = true ]; then
+        info "[预览模式] 将清理现有防火墙"
+        return 0
+    fi
+    
+    for service in ufw firewalld; do
+        if systemctl is-active --quiet "$service" 2>/dev/null; then
+            systemctl stop "$service" >/dev/null 2>&1 || true
+            systemctl disable "$service" >/dev/null 2>&1 || true
+            success "已禁用 $service"
+        fi
+    done
+    
+    if command -v ufw >/dev/null 2>&1; then
+        ufw --force reset >/dev/null 2>&1 || true
+    fi
+    
+    info "清理所有 nftables 规则..."
+    nft flush ruleset 2>/dev/null || true
+    
+    if command -v iptables >/dev/null 2>&1; then
+        info "清理旧的 iptables 规则..."
+        iptables -P INPUT ACCEPT 2>/dev/null || true
+        iptables -P FORWARD ACCEPT 2>/dev/null || true
+        iptables -P OUTPUT ACCEPT 2>/dev/null || true
+        
+        iptables -F 2>/dev/null || true
+        iptables -X 2>/dev/null || true
+        iptables -t nat -F 2>/dev/null || true
+        iptables -t nat -X 2>/dev/null || true
+        iptables -t mangle -F 2>/dev/null || true
+        iptables -t mangle -X 2>/dev/null || true
+        iptables -t raw -F 2>/dev/null || true
+        iptables -t raw -X 2>/dev/null || true
+        
+        if command -v ip6tables >/dev/null 2>&1; then
+            ip6tables -P INPUT ACCEPT 2>/dev/null || true
+            ip6tables -P FORWARD ACCEPT 2>/dev/null || true
+            ip6tables -P OUTPUT ACCEPT 2>/dev/null || true
+            ip6tables -F 2>/dev/null || true
+            ip6tables -X 2>/dev/null || true
+            ip6tables -t nat -F 2>/dev/null || true
+            ip6tables -t nat -X 2>/dev/null || true
+            ip6tables -t mangle -F 2>/dev/null || true
+            ip6tables -t mangle -X 2>/dev/null || true
+            ip6tables -t raw -F 2>/dev/null || true
+            ip6tables -t raw -X 2>/dev/null || true
+        fi
+    fi
+    
+    success "所有防火墙规则清理完成"
+}
+
+# 创建 nftables 基础结构
+create_nftables_base() {
+    info "创建 nftables 基础结构..."
+    
+    if [ "$DRY_RUN" = true ]; then
+        info "[预览模式] 将创建 nftables 基础结构"
+        return 0
+    fi
+    
+    nft add table inet "$NFT_TABLE"
+    
+    nft add chain inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" { type filter hook input priority 0 \; policy drop \; }
+    nft add chain inet "$NFT_TABLE" "$NFT_CHAIN_FORWARD" { type filter hook forward priority 0 \; policy drop \; }
+    nft add chain inet "$NFT_TABLE" "$NFT_CHAIN_OUTPUT" { type filter hook output priority 0 \; policy accept \; }
+    nft add chain inet "$NFT_TABLE" "$NFT_CHAIN_PREROUTING" { type nat hook prerouting priority -100 \; }
+    
+    nft add chain inet "$NFT_TABLE" "$NFT_CHAIN_SSH"
+    
+    success "nftables 基础结构创建完成"
+}
+
+# 设置 SSH 保护
+setup_ssh_protection() {
+    info "设置 SSH 暴力破解防护..."
+    
+    if [ "$DRY_RUN" = true ]; then
+        info "[预览模式] 将设置 SSH 保护"
+        return 0
+    fi
+    
+    nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_SSH" ct state established,related accept
+    nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_SSH" tcp dport "$SSH_PORT" limit rate 4/minute burst 4 packets accept
+    nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_SSH" tcp dport "$SSH_PORT" drop
+    
+    success "SSH 暴力破解防护已配置"
+}
+
+# 应用 nftables 防火墙规则
+apply_firewall_rules() {
+    info "应用 nftables 防火墙规则..."
+    
+    if [ "$DRY_RUN" = true ]; then
+        info "[预览模式] 防火墙规则预览:"
+        show_rules_preview
+        return 0
+    fi
+    
+    create_nftables_base
+    
+    nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" iif "lo" accept
+    
+    nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" ct state established,related accept
+    
+    nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" icmp type echo-request limit rate 10/second accept
+    nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" icmpv6 type echo-request limit rate 10/second accept
+    
+    setup_ssh_protection
+    nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" tcp dport "$SSH_PORT" jump "$NFT_CHAIN_SSH"
+    
+    if [ ${#DETECTED_PORTS[@]} -gt 0 ]; then
+        local tcp_ports=""
+        local udp_ports=""
+        
+        for port in "${DETECTED_PORTS[@]}"; do
+            if [ -z "$tcp_ports" ]; then
+                tcp_ports="$port"
+                udp_ports="$port"
+            else
+                tcp_ports="$tcp_ports, $port"
+                udp_ports="$udp_ports, $port"
+            fi
+            debug_log "开放端口: $port (TCP/UDP)"
+        done
+        
+        nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" tcp dport { $tcp_ports } accept
+        
+        nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" udp dport { $udp_ports } accept
+        
+        info "已开放 ${#DETECTED_PORTS[@]} 个端口 (TCP/UDP)"
+    fi
+    
+    if [ ${#NAT_RULES[@]} -gt 0 ]; then
+        info "应用端口转发规则..."
+        for rule in "${NAT_RULES[@]}"; do
+            local port_range=$(split_nat_rule "$rule" "->" "1")
+            local target_port=$(split_nat_rule "$rule" "->" "2")
+            
+            if [ -n "$port_range" ] && [ -n "$target_port" ]; then
+                local start_port=$(echo "$port_range" | cut -d'-' -f1)
+                local end_port=$(echo "$port_range" | cut -d'-' -f2)
+                
+                nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_PREROUTING" tcp dport "$start_port-$end_port" dnat to ":$target_port"
+                nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_PREROUTING" udp dport "$start_port-$end_port" dnat to ":$target_port"
+                
+                nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" tcp dport "$start_port-$end_port" accept
+                nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" udp dport "$start_port-$end_port" accept
+                
+                success "应用端口转发: $port_range -> $target_port"
+                debug_log "NAT 规则: $start_port-$end_port -> $target_port"
+            else
+                warning "无法解析 NAT 规则: $rule"
+            fi
+        done
+    fi
+    
+    nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" limit rate 3/minute burst 3 packets log prefix \"nftables-drop: \" level warn
+    
+    OPENED_PORTS=${#DETECTED_PORTS[@]}
+    success "nftables 规则应用成功"
+    
+    save_nftables_rules
+}
+
+# 保存 nftables 规则
+save_nftables_rules() {
+    info "保存 nftables 规则..."
+    
+    if [ "$DRY_RUN" = true ]; then
+        info "[预览模式] 将保存 nftables 规则"
+        return 0
+    fi
+    
+    mkdir -p /etc/nftables.d
+    
+    nft list ruleset > /etc/nftables.conf
+    
+    cat > /etc/systemd/system/nftables-restore.service << 'EOF'
+[Unit]
+Description=Restore nftables rules
+After=network-pre.target
+Before=network.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/nft -f /etc/nftables.conf
+ExecReload=/usr/sbin/nft -f /etc/nftables.conf
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    systemctl daemon-reload
+    systemctl enable nftables-restore.service >/dev/null 2>&1 || true
+    
+    if systemctl list-unit-files 2>/dev/null | grep -q "nftables.service"; then
+        systemctl enable nftables.service >/dev/null 2>&1 || true
+    fi
+    
+    success "nftables 规则已保存并配置开机自启"
+}
+
+# 显示规则预览
+show_rules_preview() {
+    echo -e "${CYAN}📋 即将应用的 nftables 规则预览:${RESET}"
+    echo
+    echo "# 创建表和链"
+    echo "nft add table inet $NFT_TABLE"
+    echo "nft add chain inet $NFT_TABLE $NFT_CHAIN_INPUT { type filter hook input priority 0 ; policy drop ; }"
+    echo "nft add chain inet $NFT_TABLE $NFT_CHAIN_FORWARD { type filter hook forward priority 0 ; policy drop ; }"
+    echo "nft add chain inet $NFT_TABLE $NFT_CHAIN_OUTPUT { type filter hook output priority 0 ; policy accept ; }"
+    echo "nft add chain inet $NFT_TABLE $NFT_CHAIN_PREROUTING { type nat hook prerouting priority -100 ; }"
+    echo "nft add chain inet $NFT_TABLE $NFT_CHAIN_SSH"
+    echo
+    echo "# 基本规则"
+    echo "nft add rule inet $NFT_TABLE $NFT_CHAIN_INPUT iif lo accept"
+    echo "nft add rule inet $NFT_TABLE $NFT_CHAIN_INPUT ct state established,related accept"
+    echo
+    echo "# ICMP 支持"
+    echo "nft add rule inet $NFT_TABLE $NFT_CHAIN_INPUT icmp type echo-request limit rate 10/second accept"
+    echo "nft add rule inet $NFT_TABLE $NFT_CHAIN_INPUT icmpv6 type echo-request limit rate 10/second accept"
+    echo
+    echo "# SSH 保护"
+    echo "nft add rule inet $NFT_TABLE $NFT_CHAIN_SSH ct state established,related accept"
+    echo "nft add rule inet $NFT_TABLE $NFT_CHAIN_SSH tcp dport $SSH_PORT limit rate 4/minute burst 4 packets accept"
+    echo "nft add rule inet $NFT_TABLE $NFT_CHAIN_SSH tcp dport $SSH_PORT drop"
+    echo "nft add rule inet $NFT_TABLE $NFT_CHAIN_INPUT tcp dport $SSH_PORT jump $NFT_CHAIN_SSH"
+    echo
+    if [ ${#DETECTED_PORTS[@]} -gt 0 ]; then
+        echo "# 代理端口"
+        local tcp_ports=""
+        local udp_ports=""
+        
+        for port in "${DETECTED_PORTS[@]}"; do
+            if [ -z "$tcp_ports" ]; then
+                tcp_ports="$port"
+                udp_ports="$port"
+            else
+                tcp_ports="$tcp_ports, $port"
+                udp_ports="$udp_ports, $port"
+            fi
+        done
+        
+        echo "nft add rule inet $NFT_TABLE $NFT_CHAIN_INPUT tcp dport { $tcp_ports } accept"
+        echo "nft add rule inet $NFT_TABLE $NFT_CHAIN_INPUT udp dport { $udp_ports } accept"
+    fi
+    
+    if [ ${#NAT_RULES[@]} -gt 0 ]; then
+        echo
+        echo "# 端口转发规则"
+        for rule in "${NAT_RULES[@]}"; do
+            local port_range=$(split_nat_rule "$rule" "->" "1")
+            local target_port=$(split_nat_rule "$rule" "->" "2")
+            local start_port=$(echo "$port_range" | cut -d'-' -f1)
+            local end_port=$(echo "$port_range" | cut -d'-' -f2)
+            echo "nft add rule inet $NFT_TABLE $NFT_CHAIN_PREROUTING tcp dport $start_port-$end_port dnat to :$target_port"
+            echo "nft add rule inet $NFT_TABLE $NFT_CHAIN_PREROUTING udp dport $start_port-$end_port dnat to :$target_port"
+            echo "nft add rule inet $NFT_TABLE $NFT_CHAIN_INPUT tcp dport $start_port-$end_port accept"
+            echo "nft add rule inet $NFT_TABLE $NFT_CHAIN_INPUT udp dport $start_port-$end_port accept"
+        done
+    fi
+    
+    echo
+    echo "# 日志记录和丢弃"
+    echo "nft add rule inet $NFT_TABLE $NFT_CHAIN_INPUT limit rate 3/minute burst 3 packets log prefix \"nftables-drop: \" level warn"
+}
+
+# 验证端口转发功能
+verify_port_hopping() {
+    if [ ${#NAT_RULES[@]} -gt 0 ]; then
+        info "验证端口转发配置..."
+        
+        echo -e "\n${CYAN}🔍 当前 NAT 规则状态:${RESET}"
+        if command -v nft >/dev/null 2>&1 && nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+            nft list chain inet "$NFT_TABLE" "$NFT_CHAIN_PREROUTING" 2>/dev/null | grep "dnat to" || echo "无 NAT 规则"
+        fi
+        
+        echo -e "\n${YELLOW}💡 端口转发使用说明:${RESET}"
+        echo -e "  - 客户端可以连接到范围内的任意端口"
+        echo -e "  - 所有连接都会转发到目标端口"
+        echo -e "  - 示例：范围内端口的连接转发到目标端口"
+        
+        local checked_ports=()
+        for rule in "${NAT_RULES[@]}"; do
+            local port_range=$(split_nat_rule "$rule" "->" "1")
+            local target_port=$(split_nat_rule "$rule" "->" "2")
+            
+            debug_log "验证规则: $port_range -> $target_port"
+            
+            if [ -n "$target_port" ]; then
+                if [[ ! " ${checked_ports[*]} " =~ " $target_port " ]]; then
+                    checked_ports+=("$target_port")
+                    
+                    if ss -tlnp 2>/dev/null | grep -q ":$target_port "; then
+                        echo -e "  ${GREEN}✓ 目标端口 $target_port 正在监听${RESET}"
+                    else
+                        echo -e "  ${YELLOW}⚠️  目标端口 $target_port 未在监听${RESET}"
+                        echo -e "    ${YELLOW}提示: 请确保代理服务在端口 $target_port 上运行${RESET}"
+                    fi
+                fi
+            else
+                echo -e "  ${RED}❌ 无法解析规则: $rule${RESET}"
+            fi
+        done
+        
+        echo -e "\n${CYAN}📝 端口转发规则摘要:${RESET}"
+        local unique_rules=($(printf '%s\n' "${NAT_RULES[@]}" | sort -u))
+        for rule in "${unique_rules[@]}"; do
+            local port_range=$(split_nat_rule "$rule" "->" "1")
+            local target_port=$(split_nat_rule "$rule" "->" "2")
+            echo -e "  ${CYAN}• 端口范围 $port_range → 目标端口 $target_port${RESET}"
+        done
+    fi
+}
+
+# 重置防火墙
+reset_firewall() {
+    echo -e "${YELLOW}🔄 重置防火墙到默认状态${RESET}"
+    
+    if [ "$DRY_RUN" = false ] && [ "$AUTO_MODE" = false ]; then
+        read_with_timeout "${RED}警告: 这将清除所有 nftables 规则！\n${YELLOW}确认重置防火墙吗？[y/N]${RESET}" 15 "N"
+        if [[ ! "$REPLY" =~ ^[Yy]([eE][sS])?$ ]]; then
+            info "重置操作已取消"
+            return 0
+        fi
+    fi
+    
+    info "重置 nftables 规则..."
+    
+    if [ "$DRY_RUN" = false ]; then
+        nft flush ruleset 2>/dev/null || true
+        
+        if [ -f /etc/nftables.conf ]; then
+            > /etc/nftables.conf
+        fi
+        
+        systemctl disable nftables-restore.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/nftables-restore.service
+        systemctl daemon-reload
+        
+        if command -v iptables >/dev/null 2>&1; then
+            iptables -P INPUT ACCEPT 2>/dev/null || true
+            iptables -P FORWARD ACCEPT 2>/dev/null || true
+            iptables -P OUTPUT ACCEPT 2>/dev/null || true
+            iptables -F 2>/dev/null || true
+            iptables -X 2>/dev/null || true
+            iptables -t nat -F 2>/dev/null || true
+            iptables -t nat -X 2>/dev/null || true
+        fi
+        
+        success "防火墙已重置到默认状态"
+    else
+        info "[预览模式] 将重置所有 nftables 规则"
+    fi
+}
+
+# 显示防火墙状态
+show_firewall_status() {
+    echo -e "${CYAN}🔍 当前防火墙状态${RESET}"
+    echo
+    
+    if ! command -v nft >/dev/null 2>&1; then
+        echo -e "${RED}❌ nftables 未安装${RESET}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}📊 nftables 规则统计:${RESET}"
+    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        local input_rules=$(nft list chain inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" 2>/dev/null | grep -c "accept\|drop\|reject" || echo "0")
+        local nat_rules=$(nft list chain inet "$NFT_TABLE" "$NFT_CHAIN_PREROUTING" 2>/dev/null | grep -c "dnat to" || echo "0")
+        echo -e "  INPUT 规则数: $input_rules"
+        echo -e "  NAT 规则数: $nat_rules"
+    else
+        echo -e "  ${YELLOW}⚠️  未找到 $NFT_TABLE 表${RESET}"
+    fi
+    echo
+    
+    echo -e "${GREEN}🔓 开放的端口:${RESET}"
+    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        nft list chain inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" 2>/dev/null | grep -E "(tcp|udp) dport" | while read -r line; do
+            if echo "$line" | grep -q "accept"; then
+                local ports=$(echo "$line" | grep -oE "dport \{[^}]+\}|dport [0-9-]+" | sed 's/dport //g' | tr -d '{}')
+                local protocol=$(echo "$line" | grep -oE "tcp|udp")
+                if [ -n "$ports" ]; then
+                    echo -e "  • $ports ($protocol)"
+                fi
+            fi
+        done
+    else
+        echo -e "  ${YELLOW}无规则表${RESET}"
+    fi
+    echo
+    
+    echo -e "${GREEN}🔄 端口转发规则:${RESET}"
+    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        local nat_count=$(nft list chain inet "$NFT_TABLE" "$NFT_CHAIN_PREROUTING" 2>/dev/null | grep -c "dnat to" || echo "0")
+        
+        if [ "$nat_count" -gt 0 ]; then
+            nft list chain inet "$NFT_TABLE" "$NFT_CHAIN_PREROUTING" 2>/dev/null | grep "dnat to" | while read -r line; do
+                local port_range=$(echo "$line" | grep -oE "dport [0-9-]+" | sed 's/dport //g')
+                local target=$(echo "$line" | grep -oE "dnat to :[0-9]+" | sed 's/dnat to ://g')
+                if [ -n "$port_range" ] && [ -n "$target" ]; then
+                    echo -e "  • $port_range → $target"
+                fi
+            done
+        else
+            echo -e "  ${YELLOW}无端口转发规则${RESET}"
+        fi
+    else
+        echo -e "  ${YELLOW}无规则表${RESET}"
+    fi
+    echo
+    
+    echo -e "${GREEN}🛡️  SSH 保护状态:${RESET}"
+    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1 && nft list chain inet "$NFT_TABLE" "$NFT_CHAIN_SSH" 2>/dev/null | grep -q "limit rate"; then
+        echo -e "  ${GREEN}✓ SSH 暴力破解防护已启用${RESET}"
+    else
+        echo -e "  ${YELLOW}⚠️  SSH 暴力破解防护未启用${RESET}"
+    fi
+    echo
+    
+    echo -e "${CYAN}🔧 管理命令:${RESET}"
+    echo -e "  ${YELLOW}查看所有规则:${RESET} nft list ruleset"
+    echo -e "  ${YELLOW}查看表规则:${RESET} nft list table inet $NFT_TABLE"
+    echo -e "  ${YELLOW}查看监听端口:${RESET} ss -tlnp"
+    echo -e "  ${YELLOW}重新配置:${RESET} bash $0"
+    echo -e "  ${YELLOW}重置防火墙:${RESET} bash $0 --reset"
+}
+
+# 显示最终状态
+show_final_status() {
+    echo -e "\n${GREEN}=================================="
+    echo -e "🎉 nftables 防火墙配置完成！"
+    echo -e "==================================${RESET}"
+    
+    echo -e "\n${CYAN}📊 配置摘要:${RESET}"
+    echo -e "  ${GREEN}✓ 开放端口数: $OPENED_PORTS${RESET}"
+    echo -e "  ${GREEN}✓ SSH 端口: $SSH_PORT (已保护)${RESET}"
+    echo -e "  ${GREEN}✓ 防火墙引擎: nftables${RESET}"
+    echo -e "  ${GREEN}✓ 内部服务保护: 已启用${RESET}"
+    echo -e "  ${GREEN}✓ 默认端口: 80, 443 (永久开放)${RESET}"
+    if [ ${#NAT_RULES[@]} -gt 0 ]; then
+        local unique_nat_rules=($(printf '%s\n' "${NAT_RULES[@]}" | sort -u))
+        echo -e "  ${GREEN}✓ 端口转发规则: ${#unique_nat_rules[@]} 条${RESET}"
+    fi
+    
+    if [ ${#DETECTED_PORTS[@]} -gt 0 ]; then
+        echo -e "\n${GREEN}🔓 已开放端口:${RESET}"
+        for port in "${DETECTED_PORTS[@]}"; do
+            if [[ " ${DEFAULT_OPEN_PORTS[*]} " =~ " $port " ]]; then
+                echo -e "  ${GREEN}• $port (TCP/UDP) - 默认开放${RESET}"
+            else
+                echo -e "  ${GREEN}• $port (TCP/UDP)${RESET}"
+            fi
+        done
+    fi
+    
+    if [ ${#NAT_RULES[@]} -gt 0 ]; then
+        echo -e "\n${CYAN}🔄 端口转发规则:${RESET}"
+        local unique_rules=($(printf '%s\n' "${NAT_RULES[@]}" | sort -u))
+        for rule in "${unique_rules[@]}"; do
+            local port_range=$(split_nat_rule "$rule" "->" "1")
+            local target_port=$(split_nat_rule "$rule" "->" "2")
+            echo -e "  ${CYAN}• $port_range → $target_port${RESET}"
+        done
+    fi
+    
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "\n${CYAN}🔍 这是预览模式，防火墙实际未被修改${RESET}"
+        return 0
+    fi
+    
+    echo -e "\n${CYAN}🔧 管理命令:${RESET}"
+    echo -e "  ${YELLOW}查看规则:${RESET} nft list ruleset"
+    echo -e "  ${YELLOW}查看表:${RESET} nft list table inet $NFT_TABLE"
+    echo -e "  ${YELLOW}查看端口:${RESET} ss -tlnp"
+    echo -e "  ${YELLOW}查看状态:${RESET} bash $0 --status"
+    echo -e "  ${YELLOW}添加端口转发:${RESET} bash $0 --add-range"
+    echo -e "  ${YELLOW}清理NAT:${RESET} bash $0 --clean-nat"
+    echo -e "  ${YELLOW}重置防火墙:${RESET} bash $0 --reset"
+    
+    echo -e "\n${GREEN}✅ 代理端口精确开放，端口转发已配置，内部服务受保护，服务器安全已启用！${RESET}"
+    
+    if [ ${#NAT_RULES[@]} -gt 0 ]; then
+        local has_unlistened=false
+        local checked_ports=()
+        
+        for rule in "${NAT_RULES[@]}"; do
+            local target_port=$(split_nat_rule "$rule" "->" "2")
+            if [ -n "$target_port" ] && [[ ! " ${checked_ports[*]} " =~ " $target_port " ]]; then
+                checked_ports+=("$target_port")
+                if ! ss -tlnp 2>/dev/null | grep -q ":$target_port "; then
+                    has_unlistened=true
+                    break
+                fi
+            fi
+        done
+        
+        if [ "$has_unlistened" = true ]; then
+            echo -e "\n${YELLOW}⚠️  提醒: 某些端口转发目标端口未在监听${RESET}"
+            echo -e "${YELLOW}   请确保相关代理服务正在运行，否则端口转发可能无法工作${RESET}"
+        fi
+    fi
+    
+    echo -e "\n${CYAN}💡 nftables 优势:${RESET}"
+    echo -e "  ${GREEN}• 更高的性能和更低的资源占用${RESET}"
+    echo -e "  ${GREEN}• 原子性操作，避免规则冲突${RESET}"
+    echo -e "  ${GREEN}• 更简洁的语法和更好的可维护性${RESET}"
+    echo -e "  ${GREEN}• 内核原生支持，未来的防火墙标准${RESET}"
+}
+
+# 主函数
+main() {
+    trap 'echo -e "\n${RED}操作被中断${RESET}"; exit 130' INT TERM
+    
+    parse_arguments "$@"
+    
+    echo -e "\n${CYAN}🚀 开始智能代理端口检测和配置...${RESET}"
+    
+    check_system
+    detect_ssh_port
+    detect_existing_nat_rules
+    cleanup_firewalls
+    
+    if ! detect_proxy_processes; then
+        warning "建议在运行此脚本之前启动代理服务以获得最佳效果"
+    fi
+    
+    parse_config_ports
+    detect_listening_ports
+    
+    if ! filter_and_confirm_ports; then
+        info "添加 Hiddify 常用端口作为备用..."
+        DETECTED_PORTS=("${HIDDIFY_COMMON_PORTS[@]}")
+        if ! filter_and_confirm_ports; then
+            error_exit "无法确定要开放的端口"
+        fi
+    fi
+    
+    apply_firewall_rules
+    verify_port_hopping
+    show_final_status
+}
+
+# 脚本入口点
+main "$@" | sort -nu || echo "")
+                    if [ -n "$ports" ]; then
+                        while read -r port; do
+                            if ! is_internal_service_port "$port"; then
+                                config_ports+=("$port")
+                                debug_log "从 $config_file 解析端口: $port"
+                            fi
+                        done <<< "$ports"
+                    fi
+                else
+                    # 不使用 jq 的简单解析
+                    local ports=$(grep -oE '"port"[[:space:]]*:[[:space:]]*[0-9]+' "$config_file" 2>/dev/null | grep -oE '[0-9]+' | sort -nu || echo "")
+                    if [ -n "$ports" ]; then
+                        while read -r port; do
+                            if ! is_internal_service_port "$port"; then
+                                config_ports+=("$port")
+                                debug_log "从 $config_file 简单解析端口: $port"
+                            fi
+                        done <<< "$ports"
+                    fi
+                fi
+            elif [[ "$config_file" =~ \.(yaml|yml)$ ]]; then
+                local ports=$(grep -oE 'port[[:space:]]*:[[:space:]]*[0-9]+' "$config_file" 2>/dev/null | grep -oE '[0-9]+' | sort -nu || echo "")
+                if [ -n "$ports" ]; then
+                    while read -r port; do
+                        if ! is_internal_service_port "$port"; then
+                            config_ports+=("$port")
+                            debug_log "从 $config_file 解析 YAML 端口: $port"
+                        fi
+                    done <<< "$ports"
+                fi
+            fi
+        fi
+        
+        # 避免检查过多文件导致卡住
+        if [ $file_count -ge 10 ]; then
+            debug_log "已检查 10 个配置文件，跳过剩余"
+            break
+        fi
+    done
+    
+    if [ ${#config_ports[@]} -gt 0 ]; then
+        local unique_ports=($(printf '%s\n' "${config_ports[@]}" | sort -nu))
+        DETECTED_PORTS+=("${unique_ports[@]}")
+        success "从配置文件解析到 ${#unique_ports[@]} 个端口"
+    fi
+    
+    if [ ${#NAT_RULES[@]} -gt 0 ]; then
+        echo -e "\n${GREEN}🎯 从配置文件检测到端口跳跃:${RESET}"
+        for rule in "${NAT_RULES[@]}"; do
+            echo -e "  ${GREEN}• $rule${RESET}"
+        done
+    fi
+}
+
+# 检测监听端口
+detect_listening_ports() {
+    info "检测当前监听端口..."
+    
+    local listening_ports=()
+    local localhost_ports=()
+    
+    # 使用 timeout 防止 ss 命令卡住
+    local ss_output=$(timeout 10 ss -tulnp 2>/dev/null || echo "")
+    
+    if [ -z "$ss_output" ]; then
+        warning "无法获取监听端口信息"
+        return 0
+    fi
+    
+    while IFS= read -r line; do
+        if [[ "$line" =~ LISTEN ]] || [[ "$line" =~ UNCONN ]]; then
+            local protocol=$(echo "$line" | awk '{print tolower($1)}')
+            local address_port=$(echo "$line" | awk '{print $5}')
+            local process_info=$(echo "$line" | grep -oE 'users:\(\([^)]*\)\)' | head -1)
+            
+            local port=$(echo "$address_port" | grep -oE '[0-9]+$')
+            
+            local process="unknown"
+            if [[ "$process_info" =~ \"([^\"]+)\" ]]; then
+                process="${BASH_REMATCH[1]}"
+            fi
+            
+            local bind_type=$(check_bind_address "$address_port")
+            
+            debug_log "检测到监听: $address_port - $protocol - $process - $bind_type"
+            
+            if is_proxy_related "$process" && [ -n "$port" ] && [ "$port" != "$SSH_PORT" ]; then
+                if [ "$bind_type" = "public" ]; then
+                    if ! is_internal_service_port "$port"; then
+                        listening_ports+=("$port")
+                        debug_log "检测到公共代理端口: $port"
+                    else
+                        debug_log "跳过内部服务端口: $port"
+                    fi
+                elif [ "$bind_type" = "localhost" ]; then
+                    localhost_ports+=("$port")
+                    debug_log "检测到本地代理端口: $port"
+                fi
+            fi
+        fi
+    done <<< "$ss_output"
+    
+    if [ ${#localhost_ports[@]} -gt 0 ]; then
+        echo -e "\n${YELLOW}🔒 检测到内部服务端口（仅本地）:${RESET}"
+        for port in $(printf '%s\n' "${localhost_ports[@]}" | sort -nu); do
+            echo -e "  ${YELLOW}• $port${RESET} - 内部服务，不暴露"
+        done
+    fi
+    
+    if [ ${#listening_ports[@]} -gt 0 ]; then
+        local unique_ports=($(printf '%s\n' "${listening_ports[@]}" | sort -nu))
+        DETECTED_PORTS+=("${unique_ports[@]}")
+        success "检测到 ${#unique_ports[@]} 个公共监听端口"
+    fi
+}
+
+# 检查进程是否为代理相关
+is_proxy_related() {
+    local process="$1"
+    
+    for proxy_proc in "${PROXY_CORE_PROCESSES[@]}" "${WEB_PANEL_PROCESSES[@]}"; do
+        if [[ "$process" == *"$proxy_proc"* ]]; then
+            return 0
+        fi
+    done
+    
+    if [[ "$process" =~ (proxy|vpn|tunnel|shadowsocks|trojan|v2ray|xray|clash|hysteria|sing) ]]; then
+        return 0
+    fi
+    
+    return 1
+}
+
+# 检查端口是否为内部服务
+is_internal_service_port() {
+    local port="$1"
+    
+    for internal_port in "${INTERNAL_SERVICE_PORTS[@]}"; do
+        if [ "$port" = "$internal_port" ]; then
+            return 0
+        fi
+    done
+    
+    return 1
+}
+
+# 检查端口是否为标准代理端口
+is_standard_proxy_port() {
+    local port="$1"
+    
+    # 常用代理端口
+    local common_ports=(80 443 1080 1085 8080 8388 8443 8880 8888 9443)
+    for common_port in "${common_ports[@]}"; do
+        if [ "$port" = "$common_port" ]; then
+            return 0
+        fi
+    done
+    
+    # 16xxx 端口范围（Sing-box/Xray 常用）
+    if [ "$port" -ge 16000 ] && [ "$port" -le 17000 ]; then
+        return 0
+    fi
+    
+    # 高端口范围
     if [ "$port" -ge 30000 ] && [ "$port" -le 39999 ]; then
         return 0
     fi
