@@ -712,11 +712,15 @@ is_standard_proxy_port() {
 
 # 检测端口跳跃模式（连续端口）
 detect_port_hopping_pattern() {
-    local ports=("$@")
+    local ports_array=("$@")
     local hopping_ranges=()
     
+    if [ ${#ports_array[@]} -eq 0 ]; then
+        return 0
+    fi
+    
     # 排序端口
-    local sorted_ports=($(printf '%s\n' "${ports[@]}" | sort -n))
+    local sorted_ports=($(printf '%s\n' "${ports_array[@]}" | sort -n))
     
     local range_start=""
     local range_end=""
@@ -726,16 +730,19 @@ detect_port_hopping_pattern() {
         if [ -z "$prev_port" ]; then
             range_start="$port"
             range_end="$port"
-        elif [ $((prev_port + 1)) -eq "$port" ]; then
-            range_end="$port"
         else
-            # 如果连续端口超过3个，认为是端口跳跃
-            local range_size=$((range_end - range_start + 1))
-            if [ "$range_size" -ge 3 ]; then
-                hopping_ranges+=("$range_start-$range_end")
+            local next_expected=$((prev_port + 1))
+            if [ "$next_expected" -eq "$port" ]; then
+                range_end="$port"
+            else
+                # 如果连续端口超过3个，认为是端口跳跃
+                local range_size=$((range_end - range_start + 1))
+                if [ "$range_size" -ge 3 ]; then
+                    hopping_ranges+=("$range_start-$range_end")
+                fi
+                range_start="$port"
+                range_end="$port"
             fi
-            range_start="$port"
-            range_end="$port"
         fi
         prev_port="$port"
     done
@@ -749,7 +756,9 @@ detect_port_hopping_pattern() {
     fi
     
     # 返回检测到的端口跳跃范围
-    printf '%s\n' "${hopping_ranges[@]}"
+    if [ ${#hopping_ranges[@]} -gt 0 ]; then
+        printf '%s\n' "${hopping_ranges[@]}"
+    fi
 }
 
 # 端口安全检查
@@ -826,21 +835,109 @@ filter_and_confirm_ports() {
         done
     fi
     
+    # 检测端口跳跃模式
+    local detected_hopping=()
     if [ ${#suspicious_ports[@]} -gt 0 ]; then
-        echo -e "\n${YELLOW}⚠️  可疑端口（需要确认）:${RESET}"
+        detected_hopping=($(detect_port_hopping_pattern "${suspicious_ports[@]}"))
+    fi
+    
+    if [ ${#detected_hopping[@]} -gt 0 ]; then
+        echo -e "\n${CYAN}🎯 检测到可能的端口跳跃模式:${RESET}"
+        for range in "${detected_hopping[@]}"; do
+            echo -e "  ${CYAN}• 端口范围: $range${RESET}"
+        done
+        
+        echo -e "\n${YELLOW}这些连续端口看起来像端口跳跃配置${RESET}"
+        
+        if [ "$AUTO_MODE" = false ]; then
+            read_with_timeout "${CYAN}是否配置端口跳跃转发？[Y/n]${RESET}" 15 "Y"
+            if [[ ! "$REPLY" =~ ^[Nn]$ ]]; then
+                for range in "${detected_hopping[@]}"; do
+                    echo -e "\n${CYAN}端口范围: $range${RESET}"
+                    
+                    # 询问目标端口
+                    local range_start=$(echo "$range" | cut -d'-' -f1)
+                    local suggested_target=$range_start
+                    
+                    # 检查范围内哪个端口在监听
+                    local range_end=$(echo "$range" | cut -d'-' -f2)
+                    for port in $(seq $range_start $range_end); do
+                        if ss -tlnp 2>/dev/null | grep -q ":$port "; then
+                            suggested_target=$port
+                            break
+                        fi
+                    done
+                    
+                    echo -e "${YELLOW}检测到端口 $suggested_target 在监听${RESET}"
+                    read_with_timeout "${CYAN}输入目标端口 [默认: $suggested_target]:${RESET}" 15 "$suggested_target"
+                    local target_port="$REPLY"
+                    
+                    if [[ "$target_port" =~ ^[0-9]+$ ]]; then
+                        NAT_RULES+=("$range->$target_port")
+                        DETECTED_PORTS+=("$target_port")
+                        success "配置端口跳跃: $range -> $target_port"
+                        
+                        # 从可疑端口中移除已配置的端口
+                        local new_suspicious=()
+                        for port in "${suspicious_ports[@]}"; do
+                            if [ "$port" -lt "$range_start" ] || [ "$port" -gt "$range_end" ]; then
+                                new_suspicious+=("$port")
+                            fi
+                        done
+                        suspicious_ports=("${new_suspicious[@]}")
+                    fi
+                done
+            fi
+        else
+            # 自动模式：自动配置端口跳跃
+            info "自动模式：配置端口跳跃转发"
+            for range in "${detected_hopping[@]}"; do
+                local range_start=$(echo "$range" | cut -d'-' -f1)
+                local range_end=$(echo "$range" | cut -d'-' -f2)
+                local target_port=""
+                
+                # 找到范围内第一个监听的端口作为目标
+                for port in $(seq $range_start $range_end); do
+                    if ss -tlnp 2>/dev/null | grep -q ":$port "; then
+                        target_port=$port
+                        break
+                    fi
+                done
+                
+                # 如果没有找到监听端口，使用范围起始端口
+                if [ -z "$target_port" ]; then
+                    target_port=$range_start
+                fi
+                
+                NAT_RULES+=("$range->$target_port")
+                DETECTED_PORTS+=("$target_port")
+                success "自动配置端口跳跃: $range -> $target_port"
+                
+                # 从可疑端口中移除
+                local new_suspicious=()
+                for port in "${suspicious_ports[@]}"; do
+                    if [ "$port" -lt "$range_start" ] || [ "$port" -gt "$range_end" ]; then
+                        new_suspicious+=("$port")
+                    fi
+                done
+                suspicious_ports=("${new_suspicious[@]}")
+            done
+        fi
+    fi
+    
+    if [ ${#suspicious_ports[@]} -gt 0 ]; then
+        echo -e "\n${YELLOW}⚠️  其他非标准端口:${RESET}"
         for port in "${suspicious_ports[@]}"; do
             echo -e "  ${YELLOW}? $port${RESET} - 非标准代理端口"
         done
         
-        echo -e "\n${YELLOW}这些端口可能不是必要的代理端口${RESET}"
-        
         if [ "$DRY_RUN" = false ] && [ "$AUTO_MODE" = false ]; then
-            read_with_timeout "${YELLOW}也要开放这些可疑端口吗？[y/N]${RESET}" 15 "N"
+            read_with_timeout "${YELLOW}也要开放这些端口吗？[y/N]${RESET}" 15 "N"
             if [[ "$REPLY" =~ ^[Yy]([eE][sS])?$ ]]; then
                 safe_ports+=("${suspicious_ports[@]}")
-                info "用户确认开放可疑端口"
+                info "用户确认开放其他端口"
             else
-                info "跳过可疑端口"
+                info "跳过其他非标准端口"
             fi
         fi
     fi
@@ -852,8 +949,9 @@ filter_and_confirm_ports() {
         done
     fi
     
+    # 如果没有检测到端口跳跃，询问是否手动配置
     if [ "$DRY_RUN" = false ] && [ ${#NAT_RULES[@]} -eq 0 ] && [ "$AUTO_MODE" = false ]; then
-        read_with_timeout "\n${CYAN}🔄 配置端口转发功能吗？[y/N]${RESET}\n${YELLOW}端口转发可以将端口范围重定向到单个目标端口${RESET}" 15 "N"
+        read_with_timeout "\n${CYAN}🔄 手动配置端口转发功能吗？[y/N]${RESET}\n${YELLOW}端口转发可以将端口范围重定向到单个目标端口${RESET}" 15 "N"
         if [[ "$REPLY" =~ ^[Yy]([eE][sS])?$ ]]; then
             add_port_range_interactive
         fi
