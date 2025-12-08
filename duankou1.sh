@@ -1063,11 +1063,21 @@ verify_persistence() {
         ((issues++))
     fi
     
-    local rule_count=$(nft list ruleset 2>/dev/null | grep -c "rule" || echo "0")
-    if [ "$rule_count" -gt 0 ]; then
-        success "✓ 当前有 $rule_count 条活动规则"
+    # 改进的规则检查：检查表是否存在
+    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+        # 统计各个链中的规则数
+        local input_rules=$(nft list chain inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" 2>/dev/null | grep -E "accept|drop|reject|jump|dnat" | wc -l)
+        local nat_rules=$(nft list chain inet "$NFT_TABLE" "$NFT_CHAIN_PREROUTING" 2>/dev/null | grep -E "dnat" | wc -l)
+        local total_rules=$((input_rules + nat_rules))
+        
+        if [ "$total_rules" -gt 0 ]; then
+            success "✓ 当前有 $total_rules 条活动规则 (INPUT: $input_rules, NAT: $nat_rules)"
+        else
+            warning "✗ 防火墙表存在但无规则"
+            ((issues++))
+        fi
     else
-        warning "✗ 当前没有活动规则"
+        warning "✗ 防火墙表 $NFT_TABLE 不存在"
         ((issues++))
     fi
     
