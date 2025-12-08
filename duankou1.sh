@@ -10,12 +10,12 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 # 脚本信息
-SCRIPT_VERSION="2.3.0"
+SCRIPT_VERSION="2.2.0"
 SCRIPT_NAME="精确代理端口防火墙管理脚本（nftables 版本）"
 
 echo -e "${YELLOW}== 🚀 ${SCRIPT_NAME} v${SCRIPT_VERSION} ==${RESET}"
 echo -e "${CYAN}针对 Hiddify、3X-UI、X-UI、Sing-box、Xray 等代理面板优化${RESET}"
-echo -e "${GREEN}🔧 使用 nftables 实现高性能防火墙 + 修复重复规则问题${RESET}"
+echo -e "${GREEN}🔧 使用 nftables 实现高性能防火墙${RESET}"
 
 # 权限检查
 if [ "$(id -u)" != "0" ]; then
@@ -31,6 +31,8 @@ DETECTED_PORTS=()
 PORT_RANGES=()
 NAT_RULES=()
 OPENED_PORTS=0
+OS_TYPE=""
+NFTABLES_CONF_PATH=""
 
 # nftables 表名和链名
 NFT_TABLE="proxy_firewall"
@@ -80,6 +82,22 @@ PROXY_CONFIG_FILES=(
     "/etc/trojan/config.json"
 )
 
+# Hiddify 常用端口
+HIDDIFY_COMMON_PORTS=(
+    "443" "8443" "9443"
+    "80" "8080" "8880"
+    "2053" "2083" "2087" "2096"
+)
+
+# 标准代理端口
+STANDARD_PROXY_PORTS=(
+    "80" "443" "8080" "8443" "8880" "8888"
+    "1080" "1085"
+    "8388" "8389" "9000" "9001"
+    "2080" "2443" "3128" "8964"
+    "8443" "9443"
+)
+
 # 内部服务端口（不应暴露）
 INTERNAL_SERVICE_PORTS=(
     8181 10085 10086 9090 3000 3001 8000 8001
@@ -99,26 +117,26 @@ BLACKLIST_PORTS=(
 )
 
 # 辅助函数
-debug_log() {
-    if [ "$DEBUG_MODE" = true ]; then
+debug_log() { 
+    if [ "$DEBUG_MODE" = true ]; then 
         echo -e "${BLUE}[调试] $1${RESET}"
     fi
 }
 
-error_exit() {
+error_exit() { 
     echo -e "${RED}❌ $1${RESET}"
     exit 1
 }
 
-warning() {
+warning() { 
     echo -e "${YELLOW}⚠️  $1${RESET}"
 }
 
-success() {
+success() { 
     echo -e "${GREEN}✅ $1${RESET}"
 }
 
-info() {
+info() { 
     echo -e "${CYAN}ℹ️  $1${RESET}"
 }
 
@@ -139,10 +157,47 @@ split_nat_rule() {
     fi
 }
 
+# 检测操作系统类型
+detect_os_type() {
+    info "检测操作系统类型..."
+    
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS_TYPE="$ID"
+        debug_log "检测到系统: $NAME ($ID)"
+        
+        case "$ID" in
+            debian|ubuntu|raspbian)
+                OS_TYPE="debian"
+                NFTABLES_CONF_PATH="/etc/nftables.conf"
+                ;;
+            centos|rhel|fedora|rocky|almalinux|ol)
+                OS_TYPE="rhel"
+                NFTABLES_CONF_PATH="/etc/sysconfig/nftables.conf"
+                ;;
+            arch|manjaro)
+                OS_TYPE="arch"
+                NFTABLES_CONF_PATH="/etc/nftables.conf"
+                ;;
+            *)
+                OS_TYPE="unknown"
+                NFTABLES_CONF_PATH="/etc/nftables.conf"
+                warning "未识别的系统类型: $ID，使用默认配置"
+                ;;
+        esac
+    else
+        OS_TYPE="unknown"
+        NFTABLES_CONF_PATH="/etc/nftables.conf"
+        warning "无法检测系统类型，使用默认配置"
+    fi
+    
+    success "系统类型: $OS_TYPE, 配置文件: $NFTABLES_CONF_PATH"
+}
+
 # 显示帮助信息
 show_help() {
     cat << 'EOF'
-精确代理端口防火墙管理脚本 v2.3.0（nftables 版本）
+精确代理端口防火墙管理脚本 v2.2.0（nftables 版本）
 
 为现代代理面板设计的智能端口管理工具
 
@@ -156,6 +211,12 @@ show_help() {
     --clean-nat       清理重复的NAT规则
     --status          显示当前防火墙状态
     --help, -h        显示此帮助信息
+
+支持的系统:
+    ✓ Debian / Ubuntu / Raspbian
+    ✓ CentOS / RHEL / Rocky / AlmaLinux / Oracle Linux
+    ✓ Arch Linux / Manjaro
+    ✓ 其他主流 Linux 发行版
 
 支持的代理面板/软件:
     ✓ Hiddify Manager/Panel
@@ -173,8 +234,8 @@ show_help() {
     ✓ 危险端口过滤
     ✓ SSH 暴力破解防护
     ✓ 高性能的 nftables 防火墙
-    ✓ 重复规则检测和清理
-    ✓ 单一持久化机制，避免重复加载
+    ✓ 重复NAT规则清理
+    ✓ 重启后规则持久化
 
 EOF
 }
@@ -205,7 +266,6 @@ clean_nat_rules_only() {
             nft flush chain inet "$NFT_TABLE" "$NFT_CHAIN_PREROUTING" 2>/dev/null || true
         fi
         success "已清理 $rule_count 条NAT规则"
-        
         save_nftables_rules
     else
         info "[预览模式] 将清理 $rule_count 条NAT规则"
@@ -223,19 +283,107 @@ parse_arguments() {
         case $1 in
             --debug) DEBUG_MODE=true; shift ;;
             --dry-run) DRY_RUN=true; shift ;;
-            --add-range) add_port_range_interactive; exit 0 ;;
-            --reset) reset_firewall; exit 0 ;;
-            --clean-nat) clean_nat_rules_only; exit 0 ;;
-            --status) show_firewall_status; exit 0 ;;
+            --add-range) 
+                detect_os_type
+                add_port_range_interactive
+                exit 0 
+                ;;
+            --reset) 
+                detect_os_type
+                reset_firewall
+                exit 0 
+                ;;
+            --clean-nat) 
+                detect_os_type
+                clean_nat_rules_only
+                exit 0 
+                ;;
+            --status) 
+                detect_os_type
+                show_firewall_status
+                exit 0 
+                ;;
             --help|-h) show_help; exit 0 ;;
             *) error_exit "未知参数: $1" ;;
         esac
     done
 }
 
+# 彻底清理冲突的防火墙服务
+remove_conflicting_services() {
+    info "检查并清理冲突的防火墙服务..."
+    
+    if [ "$DRY_RUN" = true ]; then
+        info "[预览模式] 将清理冲突的防火墙服务"
+        return 0
+    fi
+    
+    # 停用并禁用 UFW
+    if command -v ufw >/dev/null 2>&1; then
+        info "清理 UFW..."
+        ufw --force disable >/dev/null 2>&1 || true
+        systemctl stop ufw >/dev/null 2>&1 || true
+        systemctl disable ufw >/dev/null 2>&1 || true
+        systemctl mask ufw >/dev/null 2>&1 || true
+        success "已禁用 UFW"
+    fi
+    
+    # 停用并禁用 firewalld
+    if command -v firewalld >/dev/null 2>&1 || systemctl list-unit-files | grep -q firewalld; then
+        info "清理 firewalld..."
+        systemctl stop firewalld >/dev/null 2>&1 || true
+        systemctl disable firewalld >/dev/null 2>&1 || true
+        systemctl mask firewalld >/dev/null 2>&1 || true
+        success "已禁用 firewalld"
+    fi
+    
+    # 清理 netfilter-persistent (Debian/Ubuntu)
+    if command -v netfilter-persistent >/dev/null 2>&1 || dpkg -l 2>/dev/null | grep -q netfilter-persistent; then
+        info "清理 netfilter-persistent..."
+        systemctl stop netfilter-persistent >/dev/null 2>&1 || true
+        systemctl disable netfilter-persistent >/dev/null 2>&1 || true
+        systemctl mask netfilter-persistent >/dev/null 2>&1 || true
+        
+        if command -v apt-get >/dev/null 2>&1; then
+            DEBIAN_FRONTEND=noninteractive apt-get remove -y netfilter-persistent >/dev/null 2>&1 || true
+        fi
+        success "已禁用 netfilter-persistent"
+    fi
+    
+    # 清理 iptables-services (RHEL/CentOS)
+    if systemctl list-unit-files 2>/dev/null | grep -q iptables.service; then
+        info "清理 iptables.service..."
+        systemctl stop iptables >/dev/null 2>&1 || true
+        systemctl disable iptables >/dev/null 2>&1 || true
+        systemctl mask iptables >/dev/null 2>&1 || true
+        success "已禁用 iptables.service"
+    fi
+    
+    if systemctl list-unit-files 2>/dev/null | grep -q ip6tables.service; then
+        info "清理 ip6tables.service..."
+        systemctl stop ip6tables >/dev/null 2>&1 || true
+        systemctl disable ip6tables >/dev/null 2>&1 || true
+        systemctl mask ip6tables >/dev/null 2>&1 || true
+        success "已禁用 ip6tables.service"
+    fi
+    
+    # 清理自定义的 nftables-restore 服务
+    if [ -f /etc/systemd/system/nftables-restore.service ]; then
+        info "清理旧的 nftables-restore 服务..."
+        systemctl stop nftables-restore >/dev/null 2>&1 || true
+        systemctl disable nftables-restore >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/nftables-restore.service
+        systemctl daemon-reload
+        success "已删除旧的 nftables-restore 服务"
+    fi
+    
+    success "冲突的防火墙服务已清理"
+}
 # 检查系统环境
 check_system() {
     info "检查系统环境..."
+    
+    detect_os_type
     
     local tools=("nft" "ss" "jq")
     local missing_tools=()
@@ -249,8 +397,25 @@ check_system() {
     if [ ${#missing_tools[@]} -gt 0 ]; then
         info "安装缺失的工具: ${missing_tools[*]}"
         if [ "$DRY_RUN" = false ]; then
-            apt-get update -qq
-            apt-get install -y nftables iproute2 jq 2>&1 | grep -v "^Reading\|^Building\|^Selecting\|^Unpacking\|^Setting" || true
+            case "$OS_TYPE" in
+                debian)
+                    apt-get update -qq
+                    DEBIAN_FRONTEND=noninteractive apt-get install -y nftables iproute2 jq
+                    ;;
+                rhel)
+                    if command -v dnf >/dev/null 2>&1; then
+                        dnf install -y nftables iproute jq
+                    else
+                        yum install -y nftables iproute jq
+                    fi
+                    ;;
+                arch)
+                    pacman -S --noconfirm nftables iproute2 jq
+                    ;;
+                *)
+                    warning "请手动安装: ${missing_tools[*]}"
+                    ;;
+            esac
         fi
     fi
     
@@ -258,10 +423,9 @@ check_system() {
         if ! lsmod | grep -q nf_tables; then
             modprobe nf_tables 2>/dev/null || true
         fi
-        if ! lsmod | grep -q nf_nat; then
-            modprobe nf_nat 2>/dev/null || true
-        fi
     fi
+    
+    remove_conflicting_services
     
     success "系统环境检查完成"
 }
@@ -270,7 +434,7 @@ check_system() {
 detect_ssh_port() {
     debug_log "检测 SSH 端口..."
     
-    local ssh_port=$(ss -tlnp 2>/dev/null | grep -E 'sshd' | awk '{print $4}' | grep -oE '[0-9]+$' | head -1)
+    local ssh_port=$(ss -tlnp 2>/dev/null | grep -E ':22\b|sshd' | awk '{print $4}' | awk -F: '{print $NF}' | head -1)
     
     if [[ ! "$ssh_port" =~ ^[0-9]+$ ]] && [ -f /etc/ssh/sshd_config ]; then
         ssh_port=$(grep -i '^[[:space:]]*Port' /etc/ssh/sshd_config | awk '{print $2}' | head -1)
@@ -293,13 +457,9 @@ detect_existing_nat_rules() {
     if command -v nft >/dev/null 2>&1; then
         debug_log "扫描 nftables NAT 规则..."
         
-        for table_info in $(nft list tables 2>/dev/null | grep -E "(inet|ip)" | awk '{print $2" "$3}' || true); do
+        for table_info in $(nft list tables 2>/dev/null | grep -E "(inet|ip)" | awk '{print $2" "$3}'); do
             local family=$(echo "$table_info" | awk '{print $1}')
             local table=$(echo "$table_info" | awk '{print $2}')
-            
-            if [ -z "$family" ] || [ -z "$table" ]; then
-                continue
-            fi
             
             debug_log "检查表: $family $table"
             
@@ -311,12 +471,18 @@ detect_existing_nat_rules() {
                         local port_range=""
                         local target_port=""
                         
-                        if echo "$line" | grep -oE "[0-9]+-[0-9]+" >/dev/null 2>&1; then
+                        if echo "$line" | grep -qE "tcp dport [0-9]+-[0-9]+"; then
                             port_range=$(echo "$line" | grep -oE "[0-9]+-[0-9]+" | head -1)
+                        elif echo "$line" | grep -qE "udp dport [0-9]+-[0-9]+"; then
+                            port_range=$(echo "$line" | grep -oE "[0-9]+-[0-9]+" | head -1)
+                        elif echo "$line" | grep -qE "dport \{[0-9]+-[0-9]+\}"; then
+                            port_range=$(echo "$line" | grep -oE "\{[0-9]+-[0-9]+\}" | tr -d '{}' | head -1)
                         fi
                         
                         if echo "$line" | grep -qE "dnat to :[0-9]+"; then
-                            target_port=$(echo "$line" | grep -oE "dnat to :[0-9]+" | grep -oE "[0-9]+$")
+                            target_port=$(echo "$line" | grep -oE "dnat to :[0-9]+" | grep -oE "[0-9]+")
+                        elif echo "$line" | grep -qE "dnat to [0-9\.]+ *:[0-9]+"; then
+                            target_port=$(echo "$line" | grep -oE "dnat to [0-9\.]+ *:[0-9]+" | grep -oE "[0-9]+$")
                         fi
                         
                         if [ -n "$port_range" ] && [ -n "$target_port" ]; then
@@ -330,6 +496,37 @@ detect_existing_nat_rules() {
         done
     fi
     
+    if command -v iptables >/dev/null 2>&1; then
+        debug_log "扫描 iptables NAT 规则（兼容性检查）..."
+        
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^(num|Chain|\-\-\-|$) ]]; then
+                continue
+            fi
+            
+            if echo "$line" | grep -qE "(DNAT|dnat)"; then
+                local port_range=""
+                local target_port=""
+                
+                if echo "$line" | grep -qE "dpts:[0-9]+:[0-9]+"; then
+                    port_range=$(echo "$line" | grep -oE "dpts:[0-9]+:[0-9]+" | sed 's/dpts://' | sed 's/:/-/')
+                elif echo "$line" | grep -qE "dports [0-9]+:[0-9]+"; then
+                    port_range=$(echo "$line" | grep -oE "dports [0-9]+:[0-9]+" | awk '{print $2}' | sed 's/:/-/')
+                fi
+                
+                if echo "$line" | grep -qE "to:[0-9\.]*:[0-9]+"; then
+                    target_port=$(echo "$line" | grep -oE "to:[0-9\.]*:[0-9]+" | grep -oE "[0-9]+$")
+                fi
+                
+                if [ -n "$port_range" ] && [ -n "$target_port" ]; then
+                    local rule_key="$port_range->$target_port"
+                    nat_rules+=("$rule_key")
+                    debug_log "发现 iptables 端口转发规则: $port_range -> $target_port"
+                fi
+            fi
+        done <<< "$(iptables -t nat -L PREROUTING -n -v --line-numbers 2>/dev/null)"
+    fi
+    
     if [ ${#nat_rules[@]} -gt 0 ]; then
         local unique_rules=($(printf '%s\n' "${nat_rules[@]}" | sort -u))
         NAT_RULES=("${unique_rules[@]}")
@@ -340,7 +537,9 @@ detect_existing_nat_rules() {
                 DETECTED_PORTS+=("$target_port")
             fi
         done
-        
+    fi
+    
+    if [ ${#NAT_RULES[@]} -gt 0 ]; then
         echo -e "\n${GREEN}🔄 检测到现有端口转发规则:${RESET}"
         for rule in "${NAT_RULES[@]}"; do
             echo -e "  ${GREEN}• $rule${RESET}"
@@ -448,7 +647,7 @@ parse_config_ports() {
             
             if [[ "$config_file" =~ \.json$ ]]; then
                 if command -v jq >/dev/null 2>&1; then
-                    local ports=$(jq -r '.inbounds[]? | select(.listen == null or .listen == "" or .listen == "0.0.0.0" or .listen == "::") | .port' "$config_file" 2>/dev/null | grep -E '^[0-9]+$' | sort -nu) || true
+                    local ports=$(jq -r '.inbounds[]? | select(.listen == null or .listen == "" or .listen == "0.0.0.0" or .listen == "::") | .port' "$config_file" 2>/dev/null | grep -E '^[0-9]+$' | sort -nu)
                     if [ -n "$ports" ]; then
                         while read -r port; do
                             if ! is_internal_service_port "$port"; then
@@ -459,7 +658,7 @@ parse_config_ports() {
                     fi
                 fi
             elif [[ "$config_file" =~ \.(yaml|yml)$ ]]; then
-                local ports=$(grep -oE 'port[[:space:]]*:[[:space:]]*[0-9]+' "$config_file" 2>/dev/null | grep -oE '[0-9]+' | sort -nu) || true
+                local ports=$(grep -oE 'port[[:space:]]*:[[:space:]]*[0-9]+' "$config_file" | grep -oE '[0-9]+' | sort -nu)
                 if [ -n "$ports" ]; then
                     while read -r port; do
                         if ! is_internal_service_port "$port"; then
@@ -488,30 +687,36 @@ detect_listening_ports() {
     
     while IFS= read -r line; do
         if [[ "$line" =~ LISTEN ]] || [[ "$line" =~ UNCONN ]]; then
-            local address_port=$(echo "$line" | awk '{print $4}')
+            local protocol=$(echo "$line" | awk '{print tolower($1)}')
+            local address_port=$(echo "$line" | awk '{print $5}')
+            local process_info=$(echo "$line" | grep -oE 'users:\(\([^)]*\)\)' | head -1)
+            
             local port=$(echo "$address_port" | grep -oE '[0-9]+$')
             
-            if [ -z "$port" ] || [ "$port" = "$SSH_PORT" ]; then
-                continue
+            local process="unknown"
+            if [[ "$process_info" =~ \"([^\"]+)\" ]]; then
+                process="${BASH_REMATCH[1]}"
             fi
             
             local bind_type=$(check_bind_address "$address_port")
             
-            debug_log "检测到监听: $address_port ($bind_type)"
+            debug_log "检测到监听: $address_port ($protocol, $process, $bind_type)"
             
-            if [ "$bind_type" = "public" ]; then
-                if ! is_internal_service_port "$port"; then
-                    listening_ports+=("$port")
-                    debug_log "检测到公共代理端口: $port"
-                else
-                    debug_log "跳过内部服务端口: $port"
+            if is_proxy_related "$process" && [ -n "$port" ] && [ "$port" != "$SSH_PORT" ]; then
+                if [ "$bind_type" = "public" ]; then
+                    if ! is_internal_service_port "$port"; then
+                        listening_ports+=("$port")
+                        debug_log "检测到公共代理端口: $port ($protocol, $process)"
+                    else
+                        debug_log "跳过内部服务端口: $port"
+                    fi
+                elif [ "$bind_type" = "localhost" ]; then
+                    localhost_ports+=("$port")
+                    debug_log "检测到本地代理端口: $port ($protocol, $process) - 不暴露"
                 fi
-            elif [ "$bind_type" = "localhost" ]; then
-                localhost_ports+=("$port")
-                debug_log "检测到本地代理端口: $port - 不暴露"
             fi
         fi
-    done <<< "$(ss -tulnp 2>/dev/null)" || true
+    done <<< "$(ss -tulnp 2>/dev/null)"
     
     if [ ${#localhost_ports[@]} -gt 0 ]; then
         echo -e "\n${YELLOW}🔒 检测到内部服务端口（仅本地）:${RESET}"
@@ -525,6 +730,23 @@ detect_listening_ports() {
         DETECTED_PORTS+=("${unique_ports[@]}")
         success "检测到 ${#unique_ports[@]} 个公共监听端口"
     fi
+}
+
+# 检查进程是否为代理相关
+is_proxy_related() {
+    local process="$1"
+    
+    for proxy_proc in "${PROXY_CORE_PROCESSES[@]}" "${WEB_PANEL_PROCESSES[@]}"; do
+        if [[ "$process" == *"$proxy_proc"* ]]; then
+            return 0
+        fi
+    done
+    
+    if [[ "$process" =~ (proxy|vpn|tunnel|shadowsocks|trojan|v2ray|xray|clash|hysteria|sing) ]]; then
+        return 0
+    fi
+    
+    return 1
 }
 
 # 检查端口是否为内部服务
@@ -589,7 +811,6 @@ is_port_safe() {
     
     return 0
 }
-
 # 过滤并确认端口
 filter_and_confirm_ports() {
     info "智能端口分析和确认..."
@@ -699,7 +920,7 @@ filter_and_confirm_ports() {
         fi
         echo -e "吗？[Y/n]${RESET}"
         read -r response
-        if [[ "$response" =~ ^[Nn]([oO])?$ ]]; then
+        if [[ ! "$response" =~ ^[Yy]?$ ]]; then
             info "用户取消操作"
             exit 0
         fi
@@ -733,6 +954,36 @@ cleanup_firewalls() {
     info "清理所有 nftables 规则..."
     nft flush ruleset 2>/dev/null || true
     
+    if command -v iptables >/dev/null 2>&1; then
+        info "清理旧的 iptables 规则..."
+        iptables -P INPUT ACCEPT 2>/dev/null || true
+        iptables -P FORWARD ACCEPT 2>/dev/null || true
+        iptables -P OUTPUT ACCEPT 2>/dev/null || true
+        
+        iptables -F 2>/dev/null || true
+        iptables -X 2>/dev/null || true
+        iptables -t nat -F 2>/dev/null || true
+        iptables -t nat -X 2>/dev/null || true
+        iptables -t mangle -F 2>/dev/null || true
+        iptables -t mangle -X 2>/dev/null || true
+        iptables -t raw -F 2>/dev/null || true
+        iptables -t raw -X 2>/dev/null || true
+        
+        if command -v ip6tables >/dev/null 2>&1; then
+            ip6tables -P INPUT ACCEPT 2>/dev/null || true
+            ip6tables -P FORWARD ACCEPT 2>/dev/null || true
+            ip6tables -P OUTPUT ACCEPT 2>/dev/null || true
+            ip6tables -F 2>/dev/null || true
+            ip6tables -X 2>/dev/null || true
+            ip6tables -t nat -F 2>/dev/null || true
+            ip6tables -t nat -X 2>/dev/null || true
+            ip6tables -t mangle -F 2>/dev/null || true
+            ip6tables -t mangle -X 2>/dev/null || true
+            ip6tables -t raw -F 2>/dev/null || true
+            ip6tables -t raw -X 2>/dev/null || true
+        fi
+    fi
+    
     success "所有防火墙规则清理完成"
 }
 
@@ -743,11 +994,6 @@ create_nftables_base() {
     if [ "$DRY_RUN" = true ]; then
         info "[预览模式] 将创建 nftables 基础结构"
         return 0
-    fi
-    
-    # 检查表是否存在，存在则删除
-    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
-        nft delete table inet "$NFT_TABLE" 2>/dev/null || true
     fi
     
     nft add table inet "$NFT_TABLE"
@@ -854,135 +1100,38 @@ apply_firewall_rules() {
     save_nftables_rules
 }
 
-# 改进的 nftables 规则保存函数 - 单一持久化机制
+# 保存 nftables 规则
 save_nftables_rules() {
-    info "保存 nftables 规则并配置持久化..."
+    info "保存 nftables 规则..."
     
     if [ "$DRY_RUN" = true ]; then
         info "[预览模式] 将保存 nftables 规则"
         return 0
     fi
     
-    mkdir -p /etc/nftables.d
+    mkdir -p "$(dirname "$NFTABLES_CONF_PATH")"
     
-    nft list ruleset > /etc/nftables.conf
+    nft list ruleset > "$NFTABLES_CONF_PATH"
     
-    if [ ! -s /etc/nftables.conf ]; then
-        error_exit "规则保存失败：配置文件为空"
-    fi
-    
-    # 只使用一个持久化机制：systemd 服务
-    cat > /etc/systemd/system/nftables-restore.service << 'EOF'
-[Unit]
-Description=Restore nftables firewall rules
-Documentation=man:nft(8)
-After=network-pre.target
-Before=network.target network-online.target
-Wants=network-pre.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/sbin/nft -f /etc/nftables.conf
-ExecReload=/usr/sbin/nft flush ruleset; /usr/sbin/nft -f /etc/nftables.conf
-ExecStop=/usr/sbin/nft flush ruleset
-RemainAfterExit=yes
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target network.target
-EOF
-    
-    systemctl daemon-reload
-    
-    systemctl enable nftables-restore.service >/dev/null 2>&1
-    
-    if systemctl list-unit-files 2>/dev/null | grep -q "^nftables.service"; then
-        systemctl stop nftables.service >/dev/null 2>&1 || true
-        systemctl disable nftables.service >/dev/null 2>&1 || true
-        info "已禁用系统原生 nftables.service，使用增强版服务"
-    fi
-    
-    # 清理可能存在的其他持久化机制
-    if [ -f /etc/rc.local ]; then
-        if grep -q "nft -f /etc/nftables.conf" /etc/rc.local 2>/dev/null; then
-            sed -i '/nft -f \/etc\/nftables.conf/d' /etc/rc.local
-            sed -i '/自动恢复 nftables 规则/d' /etc/rc.local
-            info "已清理 rc.local 中的重复配置"
+    if [ "$OS_TYPE" = "rhel" ]; then
+        if [ ! -f /etc/nftables/main.nft ]; then
+            mkdir -p /etc/nftables
+            echo "include \"$NFTABLES_CONF_PATH\"" > /etc/nftables/main.nft
         fi
     fi
     
-    if crontab -l 2>/dev/null | grep -q "nft -f /etc/nftables.conf"; then
-        (crontab -l 2>/dev/null | grep -v "nft -f /etc/nftables.conf") | crontab -
-        info "已清理 cron 中的重复配置"
-    fi
+    systemctl unmask nftables.service >/dev/null 2>&1 || true
+    systemctl enable nftables.service >/dev/null 2>&1
+    systemctl restart nftables.service >/dev/null 2>&1
     
-    if systemctl is-enabled nftables-restore.service >/dev/null 2>&1; then
-        success "✓ systemd 服务已启用（单一持久化机制）"
+    if systemctl is-active --quiet nftables.service; then
+        success "nftables 服务已启动并配置开机自启"
     else
-        warning "systemd 服务启用失败，尝试手动启用"
-        systemctl enable nftables-restore.service --now
+        warning "nftables 服务启动失败，尝试手动加载规则"
+        nft -f "$NFTABLES_CONF_PATH"
     fi
     
-    if nft -c -f /etc/nftables.conf 2>/dev/null; then
-        success "✓ nftables 规则验证通过"
-    else
-        error_exit "nftables 规则验证失败，请检查配置"
-    fi
-    
-    success "nftables 规则已保存并配置持久化（避免重复加载）"
-    
-    echo -e "\n${CYAN}🔒 持久化机制:${RESET}"
-    echo -e "  ${GREEN}✓ /etc/nftables.conf${RESET} (主配置文件)"
-    echo -e "  ${GREEN}✓ nftables-restore.service${RESET} (systemd 自动加载)"
-    echo -e "  ${YELLOW}! 已禁用其他重复的持久化机制${RESET}"
-}
-
-# 验证持久化配置
-verify_persistence() {
-    info "验证持久化配置..."
-    
-    local issues=0
-    
-    if [ -f /etc/nftables.conf ] && [ -s /etc/nftables.conf ]; then
-        success "✓ 配置文件存在且有内容"
-    else
-        warning "✗ 配置文件不存在或为空"
-        ((issues++))
-    fi
-    
-    if systemctl is-enabled nftables-restore.service >/dev/null 2>&1; then
-        success "✓ systemd 服务已启用"
-    else
-        warning "✗ systemd 服务未启用"
-        ((issues++))
-    fi
-    
-    # 改进的规则检查：检查表是否存在
-    if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
-        # 统计各个链中的规则数
-        local input_rules=$(nft list chain inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" 2>/dev/null | grep -E "accept|drop|reject|jump|dnat" | wc -l)
-        local nat_rules=$(nft list chain inet "$NFT_TABLE" "$NFT_CHAIN_PREROUTING" 2>/dev/null | grep -E "dnat" | wc -l)
-        local total_rules=$((input_rules + nat_rules))
-        
-        if [ "$total_rules" -gt 0 ]; then
-            success "✓ 当前有 $total_rules 条活动规则 (INPUT: $input_rules, NAT: $nat_rules)"
-        else
-            warning "✗ 防火墙表存在但无规则"
-            ((issues++))
-        fi
-    else
-        warning "✗ 防火墙表 $NFT_TABLE 不存在"
-        ((issues++))
-    fi
-    
-    if [ $issues -eq 0 ]; then
-        success "持久化机制验证通过"
-        return 0
-    else
-        warning "发现 $issues 个持久化问题"
-        return 1
-    fi
+    success "规则已保存到: $NFTABLES_CONF_PATH"
 }
 
 # 显示规则预览
@@ -1067,9 +1216,10 @@ verify_port_hopping() {
         
         local checked_ports=()
         for rule in "${NAT_RULES[@]}"; do
+            local port_range=$(split_nat_rule "$rule" "->" "1")
             local target_port=$(split_nat_rule "$rule" "->" "2")
             
-            debug_log "验证规则: $rule"
+            debug_log "验证规则: $port_range -> $target_port"
             
             if [ -n "$target_port" ]; then
                 if [[ ! " ${checked_ports[*]} " =~ " $target_port " ]]; then
@@ -1096,13 +1246,12 @@ verify_port_hopping() {
         done
     fi
 }
-
 # 重置防火墙
 reset_firewall() {
     echo -e "${YELLOW}🔄 重置防火墙到默认状态${RESET}"
     
     if [ "$DRY_RUN" = false ]; then
-        echo -e "${RED}警告: 这将清除所有 nftables 规则和持久化配置！${RESET}"
+        echo -e "${RED}警告: 这将清除所有 nftables 规则！${RESET}"
         echo -e "${YELLOW}确认重置防火墙吗？[y/N]${RESET}"
         read -r response
         if [[ ! "$response" =~ ^[Yy]([eE][sS])?$ ]]; then
@@ -1111,33 +1260,31 @@ reset_firewall() {
         fi
     fi
     
-    info "重置 nftables 规则和配置..."
+    info "重置 nftables 规则..."
     
     if [ "$DRY_RUN" = false ]; then
         nft flush ruleset 2>/dev/null || true
         
-        if [ -f /etc/nftables.conf ]; then
-            rm -f /etc/nftables.conf
+        if [ -f "$NFTABLES_CONF_PATH" ]; then
+            > "$NFTABLES_CONF_PATH"
         fi
         
-        systemctl stop nftables-restore.service >/dev/null 2>&1 || true
-        systemctl disable nftables-restore.service >/dev/null 2>&1 || true
-        rm -f /etc/systemd/system/nftables-restore.service
-        systemctl daemon-reload
+        systemctl stop nftables.service >/dev/null 2>&1 || true
+        systemctl disable nftables.service >/dev/null 2>&1 || true
         
-        if [ -f /etc/rc.local ]; then
-            sed -i '/nft -f \/etc\/nftables.conf/d' /etc/rc.local
-            sed -i '/自动恢复 nftables 规则/d' /etc/rc.local
-        fi
-        
-        if crontab -l 2>/dev/null | grep -q "nft -f /etc/nftables.conf"; then
-            (crontab -l 2>/dev/null | grep -v "nft -f /etc/nftables.conf") | crontab -
+        if command -v iptables >/dev/null 2>&1; then
+            iptables -P INPUT ACCEPT 2>/dev/null || true
+            iptables -P FORWARD ACCEPT 2>/dev/null || true
+            iptables -P OUTPUT ACCEPT 2>/dev/null || true
+            iptables -F 2>/dev/null || true
+            iptables -X 2>/dev/null || true
+            iptables -t nat -F 2>/dev/null || true
+            iptables -t nat -X 2>/dev/null || true
         fi
         
         success "防火墙已重置到默认状态"
-        success "所有持久化配置已清理"
     else
-        info "[预览模式] 将重置所有 nftables 规则和配置"
+        info "[预览模式] 将重置所有 nftables 规则"
     fi
 }
 
@@ -1206,8 +1353,18 @@ show_firewall_status() {
     fi
     echo
     
-    echo -e "${GREEN}🔒 持久化状态:${RESET}"
-    verify_persistence
+    echo -e "${GREEN}⚙️  nftables 服务状态:${RESET}"
+    if systemctl is-active --quiet nftables.service; then
+        echo -e "  ${GREEN}✓ nftables.service 运行中${RESET}"
+    else
+        echo -e "  ${YELLOW}⚠️  nftables.service 未运行${RESET}"
+    fi
+    
+    if systemctl is-enabled --quiet nftables.service 2>/dev/null; then
+        echo -e "  ${GREEN}✓ 已配置开机自启${RESET}"
+    else
+        echo -e "  ${YELLOW}⚠️  未配置开机自启${RESET}"
+    fi
     echo
     
     echo -e "${CYAN}🔧 管理命令:${RESET}"
@@ -1216,6 +1373,8 @@ show_firewall_status() {
     echo -e "  ${YELLOW}查看监听端口:${RESET} ss -tlnp"
     echo -e "  ${YELLOW}重新配置:${RESET} bash $0"
     echo -e "  ${YELLOW}重置防火墙:${RESET} bash $0 --reset"
+    echo -e "  ${YELLOW}添加端口转发:${RESET} bash $0 --add-range"
+    echo -e "  ${YELLOW}清理NAT规则:${RESET} bash $0 --clean-nat"
 }
 
 # 显示最终状态
@@ -1228,6 +1387,8 @@ show_final_status() {
     echo -e "  ${GREEN}✓ 开放端口数: $OPENED_PORTS${RESET}"
     echo -e "  ${GREEN}✓ SSH 端口: $SSH_PORT (已保护)${RESET}"
     echo -e "  ${GREEN}✓ 防火墙引擎: nftables${RESET}"
+    echo -e "  ${GREEN}✓ 系统类型: $OS_TYPE${RESET}"
+    echo -e "  ${GREEN}✓ 配置文件: $NFTABLES_CONF_PATH${RESET}"
     echo -e "  ${GREEN}✓ 内部服务保护: 已启用${RESET}"
     echo -e "  ${GREEN}✓ 默认端口: 80, 443 (永久开放)${RESET}"
     if [ ${#NAT_RULES[@]} -gt 0 ]; then
@@ -1261,16 +1422,14 @@ show_final_status() {
         return 0
     fi
     
-    echo -e "\n${CYAN}🔒 持久化保障:${RESET}"
-    verify_persistence
-    
     echo -e "\n${CYAN}🔧 管理命令:${RESET}"
     echo -e "  ${YELLOW}查看规则:${RESET} nft list ruleset"
     echo -e "  ${YELLOW}查看表:${RESET} nft list table inet $NFT_TABLE"
     echo -e "  ${YELLOW}查看端口:${RESET} ss -tlnp"
-    echo -e "  ${YELLOW}查看状态:${RESET} bash \$0 --status"
-    echo -e "  ${YELLOW}添加端口转发:${RESET} bash \$0 --add-range"
-    echo -e "  ${YELLOW}重置防火墙:${RESET} bash \$0 --reset"
+    echo -e "  ${YELLOW}查看状态:${RESET} bash $0 --status"
+    echo -e "  ${YELLOW}添加端口转发:${RESET} bash $0 --add-range"
+    echo -e "  ${YELLOW}清理NAT规则:${RESET} bash $0 --clean-nat"
+    echo -e "  ${YELLOW}重置防火墙:${RESET} bash $0 --reset"
     
     echo -e "\n${GREEN}✅ 代理端口精确开放，端口转发已配置，内部服务受保护，服务器安全已启用！${RESET}"
     
@@ -1295,17 +1454,22 @@ show_final_status() {
         fi
     fi
     
-    echo -e "\n${CYAN}💡 nftables 优势:${RESET}"
+    echo -e "\n${CYAN}💡 重启后规则持久化:${RESET}"
+    echo -e "  ${GREEN}• 规则已保存到系统配置文件${RESET}"
+    echo -e "  ${GREEN}• nftables.service 已配置开机自启${RESET}"
+    echo -e "  ${GREEN}• 冲突的防火墙服务已禁用${RESET}"
+    echo -e "  ${GREEN}• VPS 重启后规则自动恢复${RESET}"
+    
+    echo -e "\n${CYAN}🚀 nftables 优势:${RESET}"
     echo -e "  ${GREEN}• 更高的性能和更低的资源占用${RESET}"
     echo -e "  ${GREEN}• 原子性操作，避免规则冲突${RESET}"
     echo -e "  ${GREEN}• 更简洁的语法和更好的可维护性${RESET}"
     echo -e "  ${GREEN}• 内核原生支持，未来的防火墙标准${RESET}"
-    echo -e "  ${GREEN}• 单一持久化机制，避免重复加载${RESET}"
     
-    echo -e "\n${YELLOW}💾 重启测试建议:${RESET}"
-    echo -e "  建议执行 ${CYAN}reboot${RESET} 重启系统，验证规则是否自动加载"
-    echo -e "  重启后运行 ${CYAN}bash \$0 --status${RESET} 检查规则状态"
-    echo -e "  ${GREEN}修复版已避免规则重复加载问题${RESET}"
+    echo -e "\n${CYAN}📌 验证持久化:${RESET}"
+    echo -e "  ${YELLOW}1. 查看服务状态:${RESET} systemctl status nftables"
+    echo -e "  ${YELLOW}2. 查看配置文件:${RESET} cat $NFTABLES_CONF_PATH"
+    echo -e "  ${YELLOW}3. 测试重启:${RESET} reboot (可选)"
 }
 
 # 主函数
@@ -1329,8 +1493,11 @@ main() {
     detect_listening_ports
     
     if ! filter_and_confirm_ports; then
-        info "未能确认端口，使用默认端口"
-        DETECTED_PORTS=("${DEFAULT_OPEN_PORTS[@]}")
+        info "添加 Hiddify 常用端口作为备用..."
+        DETECTED_PORTS=("${HIDDIFY_COMMON_PORTS[@]}")
+        if ! filter_and_confirm_ports; then
+            error_exit "无法确定要开放的端口"
+        fi
     fi
     
     apply_firewall_rules
