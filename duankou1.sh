@@ -10,12 +10,12 @@ CYAN="\033[36m"
 RESET="\033[0m"
 
 # 脚本信息
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.2.1"
 SCRIPT_NAME="精确代理端口防火墙管理脚本（nftables 版本）"
 
 echo -e "${YELLOW}== 🚀 ${SCRIPT_NAME} v${SCRIPT_VERSION} ==${RESET}"
 echo -e "${CYAN}针对 Hiddify、3X-UI、X-UI、Sing-box、Xray 等代理面板优化${RESET}"
-echo -e "${GREEN}🔧 使用 nftables 实现高性能防火墙 + 增强持久化${RESET}"
+echo -e "${GREEN}🔧 使用 nftables 实现高性能防火墙 + 修复重复规则问题${RESET}"
 
 # 权限检查
 if [ "$(id -u)" != "0" ]; then
@@ -115,26 +115,26 @@ BLACKLIST_PORTS=(
 )
 
 # 辅助函数
-debug_log() { 
-    if [ "$DEBUG_MODE" = true ]; then 
+debug_log() {
+    if [ "$DEBUG_MODE" = true ]; then
         echo -e "${BLUE}[调试] $1${RESET}"
     fi
 }
 
-error_exit() { 
+error_exit() {
     echo -e "${RED}❌ $1${RESET}"
     exit 1
 }
 
-warning() { 
+warning() {
     echo -e "${YELLOW}⚠️  $1${RESET}"
 }
 
-success() { 
+success() {
     echo -e "${GREEN}✅ $1${RESET}"
 }
 
-info() { 
+info() {
     echo -e "${CYAN}ℹ️  $1${RESET}"
 }
 
@@ -158,7 +158,7 @@ split_nat_rule() {
 # 显示帮助信息
 show_help() {
     cat << 'EOF'
-精确代理端口防火墙管理脚本 v2.2.0（nftables 版本）
+精确代理端口防火墙管理脚本 v2.2.1（nftables 版本）
 
 为现代代理面板设计的智能端口管理工具
 
@@ -189,8 +189,8 @@ show_help() {
     ✓ 危险端口过滤
     ✓ SSH 暴力破解防护
     ✓ 高性能的 nftables 防火墙
-    ✓ 重复NAT规则清理
-    ✓ 三重持久化保障机制
+    ✓ 重复规则检测和清理
+    ✓ 单一持久化机制，避免重复加载
 
 EOF
 }
@@ -211,20 +211,17 @@ clean_nat_rules_only() {
     
     info "正在清理NAT规则..."
     
-    # 统计当前规则数量
     local rule_count=0
     if nft list table inet "$NFT_TABLE" 2>/dev/null | grep -q "dnat to"; then
         rule_count=$(nft list table inet "$NFT_TABLE" 2>/dev/null | grep -c "dnat to" || echo "0")
     fi
     
     if [ "$DRY_RUN" = false ]; then
-        # 清理 PREROUTING 链中的所有 DNAT 规则
         if nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
             nft flush chain inet "$NFT_TABLE" "$NFT_CHAIN_PREROUTING" 2>/dev/null || true
         fi
         success "已清理 $rule_count 条NAT规则"
         
-        # 保存更改
         save_nftables_rules
     else
         info "[预览模式] 将清理 $rule_count 条NAT规则"
@@ -282,7 +279,6 @@ check_system() {
         fi
     fi
     
-    # 检查 nftables 内核模块
     if [ "$DRY_RUN" = false ]; then
         if ! lsmod | grep -q nf_tables; then
             modprobe nf_tables 2>/dev/null || true
@@ -316,11 +312,9 @@ detect_existing_nat_rules() {
     
     local nat_rules=()
     
-    # 检查 nftables NAT 规则
     if command -v nft >/dev/null 2>&1; then
         debug_log "扫描 nftables NAT 规则..."
         
-        # 检查所有表中的 NAT 规则
         for table_info in $(nft list tables 2>/dev/null | grep -E "(inet|ip)" | awk '{print $2" "$3}'); do
             local family=$(echo "$table_info" | awk '{print $1}')
             local table=$(echo "$table_info" | awk '{print $2}')
@@ -335,7 +329,6 @@ detect_existing_nat_rules() {
                         local port_range=""
                         local target_port=""
                         
-                        # 解析端口范围
                         if echo "$line" | grep -qE "tcp dport [0-9]+-[0-9]+"; then
                             port_range=$(echo "$line" | grep -oE "[0-9]+-[0-9]+" | head -1)
                         elif echo "$line" | grep -qE "udp dport [0-9]+-[0-9]+"; then
@@ -344,7 +337,6 @@ detect_existing_nat_rules() {
                             port_range=$(echo "$line" | grep -oE "\{[0-9]+-[0-9]+\}" | tr -d '{}' | head -1)
                         fi
                         
-                        # 解析目标端口
                         if echo "$line" | grep -qE "dnat to :[0-9]+"; then
                             target_port=$(echo "$line" | grep -oE "dnat to :[0-9]+" | grep -oE "[0-9]+")
                         elif echo "$line" | grep -qE "dnat to [0-9\.]+ *:[0-9]+"; then
@@ -362,7 +354,6 @@ detect_existing_nat_rules() {
         done
     fi
     
-    # 也检查旧的 iptables 规则（兼容性）
     if command -v iptables >/dev/null 2>&1; then
         debug_log "扫描 iptables NAT 规则（兼容性检查）..."
         
@@ -807,7 +798,6 @@ cleanup_firewalls() {
         return 0
     fi
     
-    # 停用并禁用其他防火墙服务
     for service in ufw firewalld; do
         if systemctl is-active --quiet "$service" 2>/dev/null; then
             systemctl stop "$service" >/dev/null 2>&1 || true
@@ -820,19 +810,15 @@ cleanup_firewalls() {
         ufw --force reset >/dev/null 2>&1 || true
     fi
     
-    # 清理所有 nftables 规则
     info "清理所有 nftables 规则..."
     nft flush ruleset 2>/dev/null || true
     
-    # 清理旧的 iptables 规则（兼容性）
     if command -v iptables >/dev/null 2>&1; then
         info "清理旧的 iptables 规则..."
-        # 设置临时安全策略
         iptables -P INPUT ACCEPT 2>/dev/null || true
         iptables -P FORWARD ACCEPT 2>/dev/null || true
         iptables -P OUTPUT ACCEPT 2>/dev/null || true
         
-        # 清理所有表的所有规则
         iptables -F 2>/dev/null || true
         iptables -X 2>/dev/null || true
         iptables -t nat -F 2>/dev/null || true
@@ -842,7 +828,6 @@ cleanup_firewalls() {
         iptables -t raw -F 2>/dev/null || true
         iptables -t raw -X 2>/dev/null || true
         
-        # 如果系统支持 ip6tables，也清理它
         if command -v ip6tables >/dev/null 2>&1; then
             ip6tables -P INPUT ACCEPT 2>/dev/null || true
             ip6tables -P FORWARD ACCEPT 2>/dev/null || true
@@ -870,16 +855,13 @@ create_nftables_base() {
         return 0
     fi
     
-    # 创建主表
     nft add table inet "$NFT_TABLE"
     
-    # 创建基础链
     nft add chain inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" { type filter hook input priority 0 \; policy drop \; }
     nft add chain inet "$NFT_TABLE" "$NFT_CHAIN_FORWARD" { type filter hook forward priority 0 \; policy drop \; }
     nft add chain inet "$NFT_TABLE" "$NFT_CHAIN_OUTPUT" { type filter hook output priority 0 \; policy accept \; }
     nft add chain inet "$NFT_TABLE" "$NFT_CHAIN_PREROUTING" { type nat hook prerouting priority -100 \; }
     
-    # 创建 SSH 保护链
     nft add chain inet "$NFT_TABLE" "$NFT_CHAIN_SSH"
     
     success "nftables 基础结构创建完成"
@@ -894,7 +876,6 @@ setup_ssh_protection() {
         return 0
     fi
     
-    # SSH 保护链规则
     nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_SSH" ct state established,related accept
     nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_SSH" tcp dport "$SSH_PORT" limit rate 4/minute burst 4 packets accept
     nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_SSH" tcp dport "$SSH_PORT" drop
@@ -912,26 +893,19 @@ apply_firewall_rules() {
         return 0
     fi
     
-    # 创建基础结构
     create_nftables_base
     
-    # 基本规则：允许回环接口
     nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" iif "lo" accept
     
-    # 基本规则：允许已建立和相关连接
     nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" ct state established,related accept
     
-    # ICMP 支持（网络诊断）
     nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" icmp type echo-request limit rate 10/second accept
     nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" icmpv6 type echo-request limit rate 10/second accept
     
-    # SSH 保护
     setup_ssh_protection
     nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" tcp dport "$SSH_PORT" jump "$NFT_CHAIN_SSH"
     
-    # 开放代理端口（TCP 和 UDP）
     if [ ${#DETECTED_PORTS[@]} -gt 0 ]; then
-        # 创建端口集合以提高性能
         local tcp_ports=""
         local udp_ports=""
         
@@ -946,16 +920,13 @@ apply_firewall_rules() {
             debug_log "开放端口: $port (TCP/UDP)"
         done
         
-        # 添加 TCP 端口规则
         nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" tcp dport { $tcp_ports } accept
         
-        # 添加 UDP 端口规则
         nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" udp dport { $udp_ports } accept
         
         info "已开放 ${#DETECTED_PORTS[@]} 个端口 (TCP/UDP)"
     fi
     
-    # 应用 NAT 规则（端口转发）
     if [ ${#NAT_RULES[@]} -gt 0 ]; then
         info "应用端口转发规则..."
         for rule in "${NAT_RULES[@]}"; do
@@ -966,11 +937,9 @@ apply_firewall_rules() {
                 local start_port=$(echo "$port_range" | cut -d'-' -f1)
                 local end_port=$(echo "$port_range" | cut -d'-' -f2)
                 
-                # 添加 DNAT 规则
                 nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_PREROUTING" tcp dport "$start_port-$end_port" dnat to ":$target_port"
                 nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_PREROUTING" udp dport "$start_port-$end_port" dnat to ":$target_port"
                 
-                # 开放端口范围
                 nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" tcp dport "$start_port-$end_port" accept
                 nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" udp dport "$start_port-$end_port" accept
                 
@@ -982,19 +951,15 @@ apply_firewall_rules() {
         done
     fi
     
-    # 记录并丢弃其他连接（限制日志频率）
     nft add rule inet "$NFT_TABLE" "$NFT_CHAIN_INPUT" limit rate 3/minute burst 3 packets log prefix \"nftables-drop: \" level warn
-    
-    # 默认丢弃策略已经在链创建时设置
     
     OPENED_PORTS=${#DETECTED_PORTS[@]}
     success "nftables 规则应用成功"
     
-    # 保存规则
     save_nftables_rules
 }
 
-# 改进的 nftables 规则保存函数
+# 改进的 nftables 规则保存函数 - 单一持久化机制
 save_nftables_rules() {
     info "保存 nftables 规则并配置持久化..."
     
@@ -1003,18 +968,15 @@ save_nftables_rules() {
         return 0
     fi
     
-    # 创建配置目录
     mkdir -p /etc/nftables.d
     
-    # 保存当前规则到主配置文件
     nft list ruleset > /etc/nftables.conf
     
-    # 验证保存的规则文件
     if [ ! -s /etc/nftables.conf ]; then
         error_exit "规则保存失败：配置文件为空"
     fi
     
-    # 创建改进的系统服务文件
+    # 只使用一个持久化机制：systemd 服务
     cat > /etc/systemd/system/nftables-restore.service << 'EOF'
 [Unit]
 Description=Restore nftables firewall rules
@@ -1036,87 +998,49 @@ StandardError=journal
 WantedBy=multi-user.target network.target
 EOF
     
-    # 重新加载 systemd
     systemctl daemon-reload
     
-    # 启用自定义服务
     systemctl enable nftables-restore.service >/dev/null 2>&1
     
-    # 尝试启用系统原生 nftables 服务（如果存在）
     if systemctl list-unit-files 2>/dev/null | grep -q "^nftables.service"; then
-        # 先停止原生服务以避免冲突
         systemctl stop nftables.service >/dev/null 2>&1 || true
         systemctl disable nftables.service >/dev/null 2>&1 || true
         info "已禁用系统原生 nftables.service，使用增强版服务"
     fi
     
-    # 验证服务状态
+    # 清理可能存在的其他持久化机制
+    if [ -f /etc/rc.local ]; then
+        if grep -q "nft -f /etc/nftables.conf" /etc/rc.local 2>/dev/null; then
+            sed -i '/nft -f \/etc\/nftables.conf/d' /etc/rc.local
+            sed -i '/自动恢复 nftables 规则/d' /etc/rc.local
+            info "已清理 rc.local 中的重复配置"
+        fi
+    fi
+    
+    if crontab -l 2>/dev/null | grep -q "nft -f /etc/nftables.conf"; then
+        (crontab -l 2>/dev/null | grep -v "nft -f /etc/nftables.conf") | crontab -
+        info "已清理 cron 中的重复配置"
+    fi
+    
     if systemctl is-enabled nftables-restore.service >/dev/null 2>&1; then
-        success "✓ systemd 服务已启用"
+        success "✓ systemd 服务已启用（单一持久化机制）"
     else
         warning "systemd 服务启用失败，尝试手动启用"
         systemctl enable nftables-restore.service --now
     fi
     
-    # 额外的持久化保障：创建 rc.local 备份方案
-    if [ ! -f /etc/rc.local ] || ! grep -q "nft -f /etc/nftables.conf" /etc/rc.local 2>/dev/null; then
-        info "配置 rc.local 备份启动方案..."
-        
-        # 创建或追加到 rc.local
-        if [ ! -f /etc/rc.local ]; then
-            cat > /etc/rc.local << 'EOF'
-#!/bin/bash
-# 自动恢复 nftables 规则（备份方案）
-sleep 3
-/usr/sbin/nft -f /etc/nftables.conf 2>/dev/null || true
-exit 0
-EOF
-            chmod +x /etc/rc.local
-        else
-            if ! grep -q "nft -f /etc/nftables.conf" /etc/rc.local 2>/dev/null; then
-                # 移除已存在的 exit 0
-                sed -i '/^exit 0/d' /etc/rc.local
-                cat >> /etc/rc.local << 'EOF'
-
-# 自动恢复 nftables 规则（备份方案）
-sleep 3
-/usr/sbin/nft -f /etc/nftables.conf 2>/dev/null || true
-exit 0
-EOF
-            fi
-        fi
-        
-        # 确保 rc.local 服务启用（某些系统需要）
-        if systemctl list-unit-files 2>/dev/null | grep -q "^rc-local.service"; then
-            systemctl enable rc-local.service >/dev/null 2>&1 || true
-        fi
-        
-        success "✓ rc.local 备份方案已配置"
-    fi
-    
-    # 创建 cron 任务作为最后保障（每次重启后检查）
-    if ! crontab -l 2>/dev/null | grep -q "nft -f /etc/nftables.conf"; then
-        info "配置 cron 备份任务..."
-        (crontab -l 2>/dev/null | grep -v "nft -f /etc/nftables.conf"; echo "@reboot sleep 5 && /usr/sbin/nft -f /etc/nftables.conf 2>&1 | logger -t nftables-restore") | crontab -
-        success "✓ cron 备份任务已配置"
-    fi
-    
-    # 立即测试规则加载
-    info "验证规则配置..."
     if nft -c -f /etc/nftables.conf 2>/dev/null; then
         success "✓ nftables 规则验证通过"
     else
         error_exit "nftables 规则验证失败，请检查配置"
     fi
     
-    success "nftables 规则已保存并配置三重持久化保障"
+    success "nftables 规则已保存并配置持久化（避免重复加载）"
     
-    # 显示持久化状态
-    echo -e "\n${CYAN}🔒 持久化保障机制:${RESET}"
+    echo -e "\n${CYAN}🔒 持久化机制:${RESET}"
     echo -e "  ${GREEN}✓ /etc/nftables.conf${RESET} (主配置文件)"
     echo -e "  ${GREEN}✓ nftables-restore.service${RESET} (systemd 自动加载)"
-    echo -e "  ${GREEN}✓ /etc/rc.local${RESET} (备份启动方案)"
-    echo -e "  ${GREEN}✓ cron @reboot${RESET} (最后保障机制)"
+    echo -e "  ${YELLOW}! 已禁用其他重复的持久化机制${RESET}"
 }
 
 # 验证持久化配置
@@ -1125,7 +1049,6 @@ verify_persistence() {
     
     local issues=0
     
-    # 检查配置文件
     if [ -f /etc/nftables.conf ] && [ -s /etc/nftables.conf ]; then
         success "✓ 配置文件存在且有内容"
     else
@@ -1133,7 +1056,6 @@ verify_persistence() {
         ((issues++))
     fi
     
-    # 检查 systemd 服务
     if systemctl is-enabled nftables-restore.service >/dev/null 2>&1; then
         success "✓ systemd 服务已启用"
     else
@@ -1141,21 +1063,6 @@ verify_persistence() {
         ((issues++))
     fi
     
-    # 检查 rc.local
-    if [ -f /etc/rc.local ] && [ -x /etc/rc.local ] && grep -q "nft -f /etc/nftables.conf" /etc/rc.local 2>/dev/null; then
-        success "✓ rc.local 备份已配置"
-    else
-        warning "✗ rc.local 备份未配置"
-    fi
-    
-    # 检查 cron
-    if crontab -l 2>/dev/null | grep -q "nft -f /etc/nftables.conf"; then
-        success "✓ cron 备份已配置"
-    else
-        warning "✗ cron 备份未配置"
-    fi
-    
-    # 检查当前规则
     local rule_count=$(nft list ruleset 2>/dev/null | grep -c "rule" || echo "0")
     if [ "$rule_count" -gt 0 ]; then
         success "✓ 当前有 $rule_count 条活动规则"
@@ -1165,7 +1072,7 @@ verify_persistence() {
     fi
     
     if [ $issues -eq 0 ]; then
-        success "所有持久化机制验证通过"
+        success "持久化机制验证通过"
         return 0
     else
         warning "发现 $issues 个持久化问题"
@@ -1302,32 +1209,26 @@ reset_firewall() {
     info "重置 nftables 规则和配置..."
     
     if [ "$DRY_RUN" = false ]; then
-        # 清空所有 nftables 规则
         nft flush ruleset 2>/dev/null || true
         
-        # 清理配置文件
         if [ -f /etc/nftables.conf ]; then
             rm -f /etc/nftables.conf
         fi
         
-        # 禁用并删除自定义服务
         systemctl stop nftables-restore.service >/dev/null 2>&1 || true
         systemctl disable nftables-restore.service >/dev/null 2>&1 || true
         rm -f /etc/systemd/system/nftables-restore.service
         systemctl daemon-reload
         
-        # 清理 rc.local 中的备份启动
         if [ -f /etc/rc.local ]; then
             sed -i '/nft -f \/etc\/nftables.conf/d' /etc/rc.local
             sed -i '/自动恢复 nftables 规则/d' /etc/rc.local
         fi
         
-        # 清理 cron 任务
         if crontab -l 2>/dev/null | grep -q "nft -f /etc/nftables.conf"; then
             (crontab -l 2>/dev/null | grep -v "nft -f /etc/nftables.conf") | crontab -
         fi
         
-        # 清理可能的 iptables 残留
         if command -v iptables >/dev/null 2>&1; then
             iptables -P INPUT ACCEPT 2>/dev/null || true
             iptables -P FORWARD ACCEPT 2>/dev/null || true
@@ -1504,11 +1405,12 @@ show_final_status() {
     echo -e "  ${GREEN}• 原子性操作，避免规则冲突${RESET}"
     echo -e "  ${GREEN}• 更简洁的语法和更好的可维护性${RESET}"
     echo -e "  ${GREEN}• 内核原生支持，未来的防火墙标准${RESET}"
-    echo -e "  ${GREEN}• 三重持久化保障，重启后自动加载${RESET}"
+    echo -e "  ${GREEN}• 单一持久化机制，避免重复加载${RESET}"
     
     echo -e "\n${YELLOW}💾 重启测试建议:${RESET}"
     echo -e "  建议执行 ${CYAN}reboot${RESET} 重启系统，验证规则是否自动加载"
     echo -e "  重启后运行 ${CYAN}bash $0 --status${RESET} 检查规则状态"
+    echo -e "  ${GREEN}修复版已避免规则重复加载问题${RESET}"
 }
 
 # 主函数
