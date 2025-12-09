@@ -1,7 +1,7 @@
 # nftables
 # 基本使用
 
-bash <(curl -sSL https://raw.githubusercontent.com/vpn3288/nftables/refs/heads/main/duankou.sh)
+bash <(curl -sSL https://raw.githubusercontent.com/vpn3288/nftables/refs/heads/main/duankou2.sh)
 
 # 预览模式（推荐首次使用）
 
