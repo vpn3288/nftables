@@ -22,22 +22,7 @@ bash <(curl -sSL https://raw.githubusercontent.com/vpn3288/nftables/refs/heads/m
 - 💾 **重启持久化** — 规则重启后自动恢复
 - 📋 **预览模式** — `--dry-run` 查看规则，不实际修改
 
----
 
-## 📖 首次使用
-
-直接运行一键命令，按提示操作即可：
-
-```
-→ SSH 端口 : 22
-→ 开放端口 : 80 443 16800 16801 16812
-⚠ 未检测到端口跳跃 → 如需添加: bash duankou.sh --add-hop
-
-确认应用以上配置？[y/N]: y
-✓ 规则已保存至 /etc/nftables.conf，nftables 开机自启已启用
-```
-
----
 
 ## 🔧 常用命令
 
