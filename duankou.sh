@@ -340,7 +340,7 @@ HEADER
     chain forward_chain {
         type filter hook forward priority filter; policy drop;
         ct state established,related accept
-        ct state dnat accept
+        ct status dnat accept
     }
 
     chain output_chain {
